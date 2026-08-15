@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-tracker-kit",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "private": true,
   "type": "module",
   "description": "Portable WhatsApp -> spreadsheet tracker for document/translation businesses: message stream -> ingestion cursor -> one LLM observation pass -> durable milestones -> projected lifecycle -> idempotent upsert.",

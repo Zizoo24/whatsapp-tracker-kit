@@ -25,7 +25,7 @@ const ROW = {
   record_id: 'R1', source_date: '2026-08-01', client_name: 'Example', phone: '971500000000',
   doc_type: 'passport', language_pair: 'English to Arabic', price: 'AED 100',
   delivery_time: 'within 24 hours', status: 'paid', summary: 'two pages', counterparty: '',
-  milestones: MILESTONES,
+  paid_at: '2026-08-01T10:00:00Z', milestones: MILESTONES,
 };
 const snap = (rows = [ROW]) => ({
   schema: 'tracker-admin-snapshot-v1',
@@ -53,13 +53,32 @@ test('setting a milestone re-projects the status, and writes both together', () 
   assert.ok(JSON.parse(w.after.milestones).final_delivered);
 });
 
-test('clearing a FALSE milestone is possible, and the status follows', () => {
+test('GUARDS #40: clearing a false payment clears EVERY view derived from it', () => {
   // The case a status-only correction could never express: a payment that never happened.
+  // v1.2.2 cleared status and the milestone but left paid_at populated, so the row read
+  // "confirmed_unpaid" and "paid at X" at once — and prep feeds paid_at back to the model.
   const p = plan(snap(), {
     corrections: [{ record_id: 'R1', milestone_ops: { clear: ['paid'] }, note: 'payment never arrived' }],
   });
-  assert.equal(p.writes[0].after.status, 'confirmed_unpaid');
-  assert.ok(!JSON.parse(p.writes[0].after.milestones).paid);
+  const after = p.writes[0].after;
+  assert.equal(after.status, 'confirmed_unpaid');
+  assert.ok(!JSON.parse(after.milestones).paid);
+  assert.equal(after.paid_at, '', 'the derived column must be cleared with its fact');
+  assert.ok(p.writes[0].changed_fields.includes('paid_at'),
+    'so the write actually carries the clear to the store');
+});
+
+test('GUARDS #40: setting a payment milestone populates paid_at from the resolved evidence', () => {
+  const p = plan(snap([{ ...ROW, status: 'confirmed_unpaid', paid_at: '', milestones: '{}' }]), {
+    corrections: [{
+      record_id: 'R1',
+      milestone_ops: { set: { paid: { evidence_msg_id: 'msg-delivered' } } },
+      note: 'payment confirmed in chat',
+    }],
+  });
+  assert.equal(p.writes[0].after.status, 'paid');
+  assert.equal(p.writes[0].after.paid_at, '2026-08-02T09:00:00Z',
+    'paid_at is derived from the milestone, never asserted separately');
 });
 
 test('GUARDS #38: at/seq come from the mirror, never from the caller', () => {
@@ -130,14 +149,53 @@ test('corrupt stored milestones can only be repaired by an explicit full replace
     corrections: [{ record_id: 'R1', milestone_ops: { clear: ['paid'] }, note: 'x' }],
   }), /unreadable[\s\S]*replace/);
 
-  const p = plan(corrupt, {
+  // GUARDS #41: replace means "replace the COLLECTION", not "skip provenance". An
+  // unverified occurrence is refused here exactly as it would be in `set`.
+  assert.throws(() => plan(corrupt, {
     corrections: [{
       record_id: 'R1',
       milestone_ops: { replace: { paid: { at: '2026-08-01T10:00:00Z', seq: 2 } } },
+      note: 'x',
+    }],
+  }), /requires evidence_msg_id/);
+
+  const p = plan(corrupt, {
+    corrections: [{
+      record_id: 'R1',
+      milestone_ops: { replace: { paid: { evidence_msg_id: 'msg-delivered' } } },
       note: 'rebuilt from the chat',
     }],
   });
   assert.equal(p.writes[0].after.status, 'paid');
+  assert.equal(JSON.parse(p.writes[0].after.milestones).paid.source, 'evidence');
+  assert.equal(p.writes[0].after.paid_at, '2026-08-02T09:00:00Z');
+});
+
+test('GUARDS #41: replace accepts a labelled baseline, and replaces the whole set', () => {
+  const p = plan(snap(), {
+    corrections: [{
+      record_id: 'R1',
+      milestone_ops: { replace: { paid: { at: '2026-06-02T00:00:00Z', source: 'operator_baseline' } } },
+      note: 'rebuilt from bank records; chat history lost',
+    }],
+  });
+  const m = JSON.parse(p.writes[0].after.milestones);
+  assert.equal(m.paid.source, 'operator_baseline');
+  assert.ok(!m.committed, 'replace REPLACES the collection rather than merging into it');
+});
+
+test('GUARDS #42: unprovable conversation identity fails closed', () => {
+  // An unmapped @lid chat resolves to a blank phone. That is UNKNOWN identity, not a pass.
+  const blindResolver = (id) => (id === 'msg-unmapped'
+    ? { at: '2026-08-02T09:00:00Z', seq: 700, phone: '' }
+    : null);
+  assert.throws(() => buildPlan(snap(), {
+    corrections: [{
+      record_id: 'R1',
+      milestone_ops: { set: { paid: { evidence_msg_id: 'msg-unmapped' } } },
+      note: 'x',
+    }],
+  }, blindResolver), /could not be resolved to a phone/);
 });
 
 test('descriptive fields are still correctable, and a null clears one', () => {

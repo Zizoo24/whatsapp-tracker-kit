@@ -61,13 +61,35 @@ test('GUARDS #31: a pre-milestone row blocks the automated lane instead of being
     'blank milestones beside a real status must not be read as "no history"');
 });
 
-test('GUARDS #32: operators correct facts, not the projection', () => {
+test('GUARDS #32/#40: operators correct facts, and every derived view is covered', () => {
   const admin = read('scripts/tracker-admin.cjs');
   assert.ok(/status is a projection of milestones and cannot be set directly/.test(admin),
     'a status-only correction vanishes on the next observation');
   assert.ok(admin.includes('milestone_ops'), 'the tool must expose the real correction target');
-  assert.ok(/'counterparty', 'milestones'\]/.test(admin),
-    'milestones must be covered by snapshot, concurrency, backup and readback');
+
+  // The authoritative state AND both views derived from it must be covered by the snapshot,
+  // concurrency check, backup and readback — a field absent from ROW_FIELDS is invisible to
+  // all four, which is how paid_at silently drifted.
+  const { ROW_FIELDS } = require('../scripts/tracker-admin.cjs');
+  for (const f of ['milestones', 'status', 'paid_at']) {
+    assert.ok(ROW_FIELDS.includes(f), `${f} must be covered by the safety machinery`);
+  }
+
+  // Derived views must never be directly correctable — that is the projection trap again.
+  const { CORRECTABLE } = require('../scripts/tracker-admin.cjs');
+  for (const f of ['status', 'paid_at']) {
+    assert.ok(!CORRECTABLE.has(f), `${f} is derived; it must not be hand-settable`);
+  }
+});
+
+test('GUARDS #41: every milestone write path goes through the evidence resolver', () => {
+  const admin = read('scripts/tracker-admin.cjs');
+  // `replace` used to hand its occurrences straight to parseMilestones, which validates
+  // shape but verifies nothing — the one path that skipped provenance.
+  assert.ok(!/ops\.replace\)\s*milestones = parseMilestones\(ops\.replace\)/.test(admin),
+    'replace must not bypass resolveOccurrence');
+  const replaceBlock = admin.slice(admin.indexOf('if (ops.replace)'), admin.indexOf('for (const name of'));
+  assert.ok(replaceBlock.includes('resolveOccurrence'), 'replace must resolve each occurrence');
 });
 
 test('the admin tool takes the SAME writer lock, rather than only advising it', () => {

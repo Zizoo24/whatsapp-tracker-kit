@@ -621,6 +621,54 @@ required relationship (`TRACKER_MAX_MSGS >= TRACKER_MAX_NEW_MSGS`) at startup.
 
 ---
 
+---
+
+## #40 — A derived column was invisible to the correction path's safety machinery
+
+`tracker-apply` derived `paid_at` from the `paid` milestone and cleared it correctly. But
+`tracker-admin` never listed `paid_at` in `ROW_FIELDS` at all — so it was **not read, not
+compared by the concurrency check, not backed up, not written and not read back**. Clearing a
+false payment left the row saying `confirmed_unpaid` **and** `paid at X`, and prep feeds
+`paid_at` back to the model as authoritative context.
+
+This is #36 again, on the *other* write path. The first fix corrected the automated lane and
+my verification checked only that lane — which is precisely how a two-path defect survives a
+confident "fixed" claim.
+
+**Guard:** `applyProjections()` writes milestones, `status` and `paid_at` together from one
+derivation, shared by both paths. `ROW_FIELDS` covers all three; `CORRECTABLE` excludes the
+two derived ones. A test asserts both properties directly rather than pinning source text.
+
+**Meta-lesson:** when a fix concerns a *class* of defect, enumerate every path in the class
+before claiming closure. "I fixed the writer" is not "I fixed the derivation".
+
+---
+
+## #41 — One correction path skipped the provenance boundary
+
+`milestone_ops.set` resolved evidence properly, but `replace` handed its occurrences straight
+to `parseMilestones`, which validates **shape** and verifies **nothing**. So an arbitrary
+`{at, seq, message_id}` — a timestamp that never existed, citing a message that never existed
+— became durable fact through the one path that skipped the resolver.
+
+**Guard:** `replace` means "replace the collection", never "bypass provenance". Every
+occurrence in `set` *and* `replace` goes through `resolveOccurrence`, i.e. an
+`evidence_msg_id` resolved from the mirror, or an explicit `source: "operator_baseline"`.
+
+---
+
+## #42 — Conversation identity failed open when it could not be resolved
+
+The correction resolver checked that a cited message belonged to the record's conversation —
+but only when the resolved phone was non-empty. An unmapped `@lid` chat yields exactly that
+blank, so unknown identity silently passed as verified. The automated prep lane already
+refuses unresolved LIDs for this reason (GUARDS #24); the correction path did not.
+
+**Guard:** if a record has a phone and the cited message's conversation cannot be positively
+resolved, the correction is refused. `operator_baseline` stays the explicit escape hatch.
+
+---
+
 ## The meta-lessons
 
 1. **Never advance a cursor over a message you did not show the model.** Every
@@ -659,3 +707,7 @@ required relationship (`TRACKER_MAX_MSGS >= TRACKER_MAX_NEW_MSGS`) at startup.
     away at persistence is ordering you never had.
 16. **Test the gap between components, not just the components.** #30 lived exactly where two
     green unit tests met.
+17. **Fixing a defect class means enumerating its paths.** #36 and #40 are one bug on two
+    write paths; verifying one and declaring the class closed is how the second survived.
+18. **Every path to authoritative state must cross the same boundary.** #41 — a single
+    unguarded route makes the guarded ones decorative.

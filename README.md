@@ -68,7 +68,7 @@ Full setup, including the store backend and the three seams you must adapt, is i
 | **[SKILL.md](SKILL.md)** | **start here** — the agent front door, setup, diagnostics |
 | [docs/INGRESS.md](docs/INGRESS.md) | **before building anything** — bridge vs. official Coexistence |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | you want the five moving parts and the failure model |
-| [docs/GUARDS.md](docs/GUARDS.md) | **before changing anything** — 39 production incidents |
+| [docs/GUARDS.md](docs/GUARDS.md) | **before changing anything** — 42 production incidents |
 | [docs/PORTING.md](docs/PORTING.md) | core invariants vs. business modules; the checklist |
 | [docs/MIGRATION.md](docs/MIGRATION.md) | **upgrading an existing store** to the milestone model |
 | [docs/LEDGER-ARCHITECTURE.md](docs/LEDGER-ARCHITECTURE.md) | you need replay, provenance, durable corrections |

@@ -87,11 +87,16 @@ cp .env.example .env          # fill in the values below
 node --test                   # sanity
 ```
 
-1. **Choose your ingress — read [docs/INGRESS.md](docs/INGRESS.md) FIRST.** If WhatsApp
-   Business App *Coexistence* fits your workflow, you can drop the bridge, the keepalive
-   lane, LID mapping and the Go toolchain entirely. If you need group chats or history from
-   before onboarding, use the bridge: see [bridge/README.md](bridge/README.md), and apply the
-   `/api/health` patch (the supervisor *requires* it).
+1. **Stand up the bridge — it is the only ingress this kit implements.** See
+   [bridge/README.md](bridge/README.md); apply the `/api/health` patch (the supervisor
+   *requires* it), build, and run once interactively to scan the QR.
+
+   WhatsApp Business App *Coexistence* could eventually remove the bridge, the keepalive
+   lane, LID mapping and the Go toolchain — but **it is not shipped**: `tracker-watch`
+   requires `WHATSAPP_BRIDGE_EXE`/`WHATSAPP_DB_PATH` and `tracker-prep` reads the bridge's
+   SQLite directly, so choosing it means **writing an ingest adapter first**. Read
+   [docs/INGRESS.md](docs/INGRESS.md) before deciding — group chats in particular usually
+   settle it.
 2. **Deploy the store backend.** Paste `apps-script/Code.gs` into the Sheet's Apps
    Script editor, set the `SHEET_SECRET` and `WATCHDOG_EMAIL` Script Properties, run
    `setupHeaders()` then `applyFilterAndSort()` then `applyStatusFormatting()` then
@@ -155,7 +160,7 @@ scripts/
   lib/
     message-cursor.cjs       the ingestion cursor. FROZEN — port verbatim.
     run-lock.cjs             atomic, owner-checked, stale-reaping run lock.
-    status-model.cjs         lifecycle model + observation reducer + transition guard.
+    status-model.cjs         milestone occurrences + the single status projection.
     client-result.cjs        fail-closed validation + stable record-id minting.
     agent-provider.cjs       provider chain (claude | codex | any command).
     bridge-supervisor.cjs    health-probe supervision + restart budget + escalation.

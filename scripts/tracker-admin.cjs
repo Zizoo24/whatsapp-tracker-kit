@@ -35,12 +35,14 @@
 //       "record_id": "...",
 //       "fields": { "price": "AED 150", "counterparty": null },     // optional, non-status
 //       "milestone_ops": {
-//         "set":   { "final_delivered": { "at": "2026-08-15T11:00:00Z", "message_id": "..." } },
-//         "clear": ["paid"]
+//         "set":     { "final_delivered": { "evidence_msg_id": "3EB0C7..." } },
+//         "clear":   ["paid"],
+//         "replace": { ... }        // replaces the COLLECTION; same provenance rules apply
 //       },
 //       "note": "why — required"
 //   } ] }
-//   A JSON null CLEARS a field. `record_id`, `phone` and `status` can never be set directly.
+//   A JSON null CLEARS a descriptive field. `record_id`, `phone`, `status` and `paid_at` can
+//   never be set directly — the last two are projections of the milestones.
 
 const fs = require('fs');
 const path = require('path');
@@ -60,14 +62,26 @@ const BACKUP_DIR = path.join(ROOT, 'backups');
 const LOCK = path.join(ROOT, '.tracker-lock');
 const MAX_SNAPSHOT_AGE_MIN = 60;
 
-// Descriptive fields a human may correct directly. `status` is deliberately ABSENT — it is a
-// projection, and correcting a projection is how a fix silently disappears on the next
-// observation. Use milestone_ops instead.
+// Descriptive fields a human may correct directly. `status` and `paid_at` are deliberately
+// ABSENT — both are PROJECTIONS of the milestones, and correcting a projection is how a fix
+// silently disappears on the next observation. Use milestone_ops instead.
 const CORRECTABLE = new Set([...RECORD_FIELDS, 'counterparty', 'source_date']);
-// `milestones` is included so the concurrency check, backup and readback all cover the
-// authoritative state — not just the human-facing view derived from it.
+// Every field the safety machinery must cover: `milestones` is the authoritative state, and
+// `status`/`paid_at` are the views derived from it. GUARDS #40 — `paid_at` was missing here,
+// so it was never read, compared, backed up or written: clearing a false payment left the row
+// reading confirmed_unpaid AND paid-at-X, and prep feeds paid_at back to the model as context.
+const DERIVED_FIELDS = ['status', 'paid_at'];
 const ROW_FIELDS = ['record_id', 'source_date', 'client_name', 'phone', 'doc_type',
-  'language_pair', 'price', 'delivery_time', 'status', 'summary', 'counterparty', 'milestones'];
+  'language_pair', 'price', 'delivery_time', 'status', 'summary', 'counterparty',
+  'paid_at', 'milestones'];
+
+// Write the derived views from the authoritative facts. The SAME derivation tracker-apply
+// performs, so the two write paths cannot disagree.
+function applyProjections(after, milestones) {
+  after.milestones = JSON.stringify(milestones);
+  after.status = projectStatus(milestones);
+  after.paid_at = milestones.paid ? milestones.paid.at : '';
+}
 
 const canon = (v) => String(v || '').replace(/\D/g, '');
 
@@ -151,9 +165,20 @@ function resolveOccurrence(name, occ, recordPhone, resolver) {
     throw new Error(`milestone ${name} cites message ${evidenceId}, which is not in the message `
       + 'mirror. Do not assert a timestamp for a message that cannot be found.');
   }
-  if (recordPhone && found.phone && found.phone !== String(recordPhone).replace(/\D/g, '')) {
+  // GUARDS #42: FAIL CLOSED when the conversation cannot be PROVEN. This check used to run
+  // only when `found.phone` was non-empty — but an unresolved `@lid` chat (no LID map)
+  // yields exactly that blank, so identity silently became "unverified" instead of
+  // "unknown". The automated prep lane already refuses unresolved LIDs for this reason.
+  // `operator_baseline` remains the explicit escape hatch.
+  const wanted = String(recordPhone || '').replace(/\D/g, '');
+  if (wanted && !found.phone) {
+    throw new Error(`milestone ${name} cites message ${evidenceId}, but its conversation could `
+      + 'not be resolved to a phone (an unmapped @lid chat). Refusing to attach unverified '
+      + 'evidence — fix the LID map, or use source:"operator_baseline" and say so explicitly.');
+  }
+  if (wanted && found.phone !== wanted) {
     throw new Error(`milestone ${name} cites message ${evidenceId} from a DIFFERENT conversation `
-      + `(${found.phone}) than the record's (${recordPhone})`);
+      + `(${found.phone}) than the record's (${wanted})`);
   }
   return { at: found.at, seq: found.seq, message_id: evidenceId, source: 'evidence' };
 }
@@ -283,7 +308,20 @@ function buildPlan(snap, proposal, resolver = createMessageResolver()) {
           milestones = {};
         } else throw e;
       }
-      if (ops.replace) milestones = parseMilestones(ops.replace);
+      // GUARDS #41: `replace` means "replace the COLLECTION", never "bypass provenance".
+      // It used to hand its occurrences straight to parseMilestones, which validates shape
+      // but verifies nothing — so an arbitrary {at, seq, message_id} became durable fact
+      // through the one path that skipped the resolver.
+      if (ops.replace) {
+        if (typeof ops.replace !== 'object' || Array.isArray(ops.replace)) {
+          throw new Error('milestone_ops.replace must be an object');
+        }
+        milestones = {};
+        for (const [name, occ] of Object.entries(ops.replace)) {
+          if (!MILESTONES.includes(name)) throw new Error('unknown milestone: ' + name);
+          milestones[name] = resolveOccurrence(name, occ, before.phone, resolver);
+        }
+      }
 
       for (const name of (Array.isArray(ops.clear) ? ops.clear : [])) {
         if (!MILESTONES.includes(name)) throw new Error('unknown milestone: ' + name);
@@ -294,9 +332,8 @@ function buildPlan(snap, proposal, resolver = createMessageResolver()) {
         milestones[name] = resolveOccurrence(name, occ, before.phone, resolver);
       }
 
-      // Write the facts AND the status they project, together, so the two can never disagree.
-      after.milestones = JSON.stringify(milestones);
-      after.status = projectStatus(milestones);
+      // Write the facts AND every view derived from them, together, so they cannot disagree.
+      applyProjections(after, milestones);
     }
 
     const changed = ROW_FIELDS.filter((f) => String(before[f] || '') !== String(after[f] || ''));
@@ -464,4 +501,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { CORRECTABLE, ROW_FIELDS, buildPlan, assertFresh, assertUnchanged, normalizeRow, parseArgs, resolveAgent };
+module.exports = { CORRECTABLE, DERIVED_FIELDS, ROW_FIELDS, buildPlan, assertFresh, assertUnchanged, normalizeRow, parseArgs, resolveAgent };
