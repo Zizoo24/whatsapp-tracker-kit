@@ -157,20 +157,42 @@ node scripts/tracker-admin.cjs apply --snapshot /tmp/snap.json --proposal /tmp/p
 node scripts/tracker-admin.cjs inspect --record RECORD_ID
 ```
 
-Proposal shape — `note` is mandatory, and a JSON `null` clears a field:
+**You correct FACTS, not the status.** `status` is a projection of the milestones, so setting
+it directly would be erased by the next observation — and it gives you no way to remove a
+*false* fact, such as a payment that never happened. The tool refuses it.
+
+Proposal shape — `note` is mandatory; a JSON `null` clears a descriptive field:
 
 ```json
-{ "corrections": [
-  { "record_id": "971500000000_2026-08-15#ab12cd34",
-    "fields": { "status": "done", "counterparty": null },
-    "note": "operator delivered this directly; confirmed in chat 2026-08-15" } ] }
+{ "corrections": [{
+  "record_id": "971500000000_2026-08-15#ab12cd34",
+  "fields": { "counterparty": null },
+  "milestone_ops": {
+    "set":   { "final_delivered": { "evidence_msg_id": "3EB0C7..." } },
+    "clear": ["paid"]
+  },
+  "note": "delivered by hand; the earlier payment was recorded in error"
+}] }
 ```
+
+**Cite a message, not a timestamp.** For `set`, give `evidence_msg_id` and the tool looks the
+message up in the mirror, checks it belongs to this record's conversation, and takes the real
+timestamp and ingestion position from it. Three separately-asserted values (`at`, `seq`,
+`message_id`) would be three things nobody verified.
+
+For a fact with genuinely no message evidence — a phone call, a lost history — say so:
+
+```json
+"set": { "paid": { "at": "2026-06-02T00:00:00+04:00", "source": "operator_baseline" } }
+```
+
+That is allowed and permanently labelled, rather than dressed up as an observation.
 
 The tool enforces the four properties that make an agent write safe: a **fresh snapshot**
 (>60 min is refused), an **optimistic concurrency check** (any row changed since the snapshot
 aborts), a **backup** of every affected row before mutating, and a **field-by-field readback**
 after writing. **Report success only when it returns `readback_verified: true`.**
 
-Note that an operator correction may move a record **backwards** — that is allowed here and
-forbidden to the automated lane, which is exactly why the transition guard lives at the
-writer and not in the store API.
+An operator correction may move a record **backwards** — clearing a false `paid` milestone
+returns it to the chase-payment stage. That is allowed here and impossible for the automated
+lane, because milestones only ever accumulate there.

@@ -28,13 +28,11 @@ const ACTION_WORDS = /\b(do|start|translate|proceed|work on|begin)\b/i;
 // read as a handoff.
 const CANCEL_WORDS = /\b(cancel|cancelled|canceled|stop|void|hold)\b/i;
 
+// Reads the CURRENT prep shape: `new_messages` is the only valid evidence. (Earlier versions
+// accepted `delta`/`conversation`; those fields no longer exist, so the heuristic silently
+// matched nothing.)
 function newBusinessMessages(input) {
-  if (Array.isArray(input.delta)) {
-    return input.delta.filter((message) => message && message.from === 'BUSINESS');
-  }
-  return (input.conversation || []).filter((message) => (
-    message && message.from === 'BUSINESS' && message.is_new === true
-  ));
+  return (input.new_messages || []).filter((message) => message && message.from === 'BUSINESS');
 }
 
 function docPattern() {

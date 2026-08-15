@@ -5,10 +5,10 @@ Turn a live WhatsApp conversation stream into **one durable row per real busines
 deterministic code.
 
 > A message stream → a deterministic scan bounded by an **ingestion-order cursor** → **one
-> model call per changed conversation** → deterministic **validation + a lifecycle reducer**
-> → an idempotent **upsert keyed by a stable record id**.
+> model call per changed conversation** → deterministic **validation** → durable
+> **milestones** → a **projected** lifecycle → an idempotent **upsert by stable record id**.
 >
-> **The model reports observations. Code derives state.**
+> **The model reports observations. Code records facts. Status is derived from the facts.**
 
 This is the portable distillation of a system that ran in production for months. Its guards
 are not defensive-programming habits — **each one is an incident that reached real data**.
@@ -68,7 +68,7 @@ Full setup, including the store backend and the three seams you must adapt, is i
 | **[SKILL.md](SKILL.md)** | **start here** — the agent front door, setup, diagnostics |
 | [docs/INGRESS.md](docs/INGRESS.md) | **before building anything** — bridge vs. official Coexistence |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | you want the five moving parts and the failure model |
-| [docs/GUARDS.md](docs/GUARDS.md) | **before changing anything** — 32 production incidents |
+| [docs/GUARDS.md](docs/GUARDS.md) | **before changing anything** — 39 production incidents |
 | [docs/PORTING.md](docs/PORTING.md) | core invariants vs. business modules; the checklist |
 | [docs/MIGRATION.md](docs/MIGRATION.md) | **upgrading an existing store** to the milestone model |
 | [docs/LEDGER-ARCHITECTURE.md](docs/LEDGER-ARCHITECTURE.md) | you need replay, provenance, durable corrections |
@@ -105,8 +105,9 @@ must agree or records are dropped. See [docs/PORTING.md](docs/PORTING.md).
 5. **Use a long-lived model token.** A normal login token expires ~daily and a headless
    subprocess cannot refresh it: silent 401s, frozen cursor, everything *looks* healthy.
    (A stray leading space in the token file also 401s.)
-6. **The transition guard belongs at the writer, never the store API** — the API is also the
-   correction path, and an operator must be able to move a record backwards.
+6. **Status is derived, never set.** One lifecycle write route: observations (or operator
+   fact-corrections) → milestones → `projectStatus`. Correcting a *status* is a fix the next
+   observation erases; correct the **milestone** instead (GUARDS #32, #34).
 
 ---
 
@@ -116,7 +117,8 @@ must agree or records are dropped. See [docs/PORTING.md](docs/PORTING.md).
   customer, never creates or modifies a payment, never writes a payment link.
 - Never commit `.env`, `agent-token.env`, or any `*.db` — they hold secrets and real
   conversation content. `.tracker-work/` holds raw conversations and is gitignored too.
-- Never run two writers concurrently. Disable the scheduled lane before an agent-lane apply.
+- Both writers take the same `.tracker-lock`, so a correction and a scheduled tick cannot
+  overlap. Stopping the scheduled task is still tidier for a long investigation session.
 
 ---
 

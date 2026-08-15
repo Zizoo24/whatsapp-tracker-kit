@@ -74,14 +74,16 @@ see GUARDS #12.
   conversation **and** the existing store rows for that counterparty, so the model
   reconciles against authoritative state instead of re-deriving history.
 - **the model** (the only judgment step): messages → structured records.
-- **apply** (pure code): validate, enforce the monotonic guard, upsert, advance the cursor.
+- **apply** (pure code): aggregate every lane's observations by record, merge them into the
+  durable milestones, project the status, upsert one row, advance the cursor.
 
 Keep the model boundary **thin**. Everything around it is deterministic and testable, which
 is what makes the failures debuggable.
 
 **Two passes, not one.** The customer pass owns the lifecycle. A separate counterparty pass
-owns only "who is doing the work", because that evidence lives in a *different chat*.
-Cross-pass precedence is explicit (`result-merge.cjs`).
+owns only "who is doing the work", because that evidence lives in a *different chat*. Both
+contribute observations for the same record; the writer aggregates them into **one row per
+record per tick** and the projection resolves the resulting state (GUARDS #30).
 
 ### 4. Durable store + secret-gated write API
 
@@ -107,7 +109,7 @@ real outages when misconfigured.
 |---|---|---|
 | **Transport** (`bridge-keepalive`) | the socket staying alive | interpret, write records, touch the cursor |
 | **Extraction** (`tracker-watch`) | routine semantics, the cursor, the run lock | run concurrently with the agent lane |
-| **Agent** (`agents/tracker-operator.md`) | corrections, audits, ambiguity, recovery | write without disabling the extraction lane first |
+| **Agent** (`tracker-admin.cjs`) | fact corrections, audits, ambiguity, recovery | set a status directly — it corrects **milestones** |
 | **Payments** (`cli.js reconcile`) | the payment log | set a record's status |
 
 WHO INTERPRETS conversations and WHO KEEPS THE SOCKET OPEN are different responsibilities

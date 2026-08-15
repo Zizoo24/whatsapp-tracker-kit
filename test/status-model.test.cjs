@@ -5,19 +5,17 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const {
-  DEAD_STAGES, HANDOFF_ELIGIBLE, MILESTONES, MilestoneStateError, OBSERVATION_MILESTONE,
-  STAGES, STATUS_RANK, VALID_STATUS,
-  canAutomatedTransition, compareOccurrence, mergeMilestones, parseMilestones, projectStatus,
+  HANDOFF_ELIGIBLE, MILESTONES, MilestoneStateError, OBSERVATION_MILESTONE,
+  STAGES, VALID_STATUS,
+  compareOccurrence, mergeMilestones, orderingIsAmbiguous, parseMilestones, projectStatus,
 } = require('../scripts/lib/status-model.cjs');
 
 const obs = (type, at, seq) => ({ type, at, seq, message_id: 'm' + (seq || 0) });
 const build = (...triples) => mergeMilestones({}, triples.map(([t, a, s]) => obs(t, a, s))).milestones;
 
-test('rank is monotonic and every valid status is rankable', () => {
-  for (let i = 1; i < STAGES.length; i++) {
-    assert.ok(STATUS_RANK[STAGES[i]] > STATUS_RANK[STAGES[i - 1]]);
-  }
-  for (const s of VALID_STATUS) assert.equal(typeof STATUS_RANK[s], 'number');
+test('every stage is a valid status and the ordering is declared once', () => {
+  for (const s of STAGES) assert.ok(VALID_STATUS.has(s));
+  assert.equal(new Set(STAGES).size, STAGES.length, 'no duplicate stages');
 });
 
 test('every observation maps to a distinct milestone', () => {
@@ -177,10 +175,45 @@ test('GUARDS #11: the handoff-eligible set excludes the committed-but-unpaid sta
   for (const s of HANDOFF_ELIGIBLE) assert.ok(VALID_STATUS.has(s));
 });
 
-test('GUARDS #13/#22: a direct status may not downgrade, but post-completion moves are allowed', () => {
-  assert.equal(canAutomatedTransition('done', 'paid').allowed, false);
-  assert.equal(canAutomatedTransition('done', 'revision').allowed, true);
-  assert.equal(canAutomatedTransition('refunded', 'paid').allowed, false);
-  assert.equal(canAutomatedTransition('cancelled', 'refunded').allowed, true);
-  for (const dead of DEAD_STAGES) assert.equal(canAutomatedTransition('paid', dead).allowed, true);
+test('GUARDS #34: the status-authority API is gone — there is one write route', () => {
+  const model = require('../scripts/lib/status-model.cjs');
+  assert.equal(model.canAutomatedTransition, undefined, 'legacy transition gate must not survive');
+  assert.equal(model.STATUS_RANK, undefined, 'rank comparison must not survive');
+});
+
+test('GUARDS #33: an unorderable revision-vs-delivery tie fails closed', () => {
+  // A v1.2.0 milestone (no seq) against a fresh one at the SAME timestamp. The order is
+  // genuinely unknowable and decides whether the customer's correction is honoured.
+  const legacy = { at: '2026-08-01T12:00:00Z', seq: null };
+  const fresh = { at: '2026-08-01T12:00:00Z', seq: 9183 };
+  assert.equal(orderingIsAmbiguous(legacy, fresh), true);
+  assert.throws(() => projectStatus({
+    paid: { at: '2026-08-01T09:00:00Z', seq: 1 },
+    final_delivered: legacy,
+    revision: fresh,
+  }), MilestoneStateError);
+
+  // Once both carry precision it resolves normally.
+  assert.equal(projectStatus({
+    paid: { at: '2026-08-01T09:00:00Z', seq: 1 },
+    final_delivered: { at: '2026-08-01T12:00:00Z', seq: 9182 },
+    revision: fresh,
+  }), 'revision');
+});
+
+test('a missing seq is UNKNOWN precision, never position zero', () => {
+  // Number(null) is 0 and Number.isFinite(0) is true, so a naive read sorted a legacy fact
+  // as the earliest possible event instead of admitting it could not be ordered.
+  const { seqOf } = require('../scripts/lib/status-model.cjs');
+  assert.equal(seqOf({ at: 'x', seq: null }), null);
+  assert.equal(seqOf({ at: 'x' }), null);
+  assert.equal(seqOf({ at: 'x', seq: 0 }), 0);
+});
+
+test('an operator baseline keeps its label through a round trip', () => {
+  const m = parseMilestones(JSON.stringify({
+    paid: { at: '2026-06-02T00:00:00+04:00', seq: null, message_id: 'operator-baseline', source: 'operator_baseline' },
+  }));
+  assert.equal(m.paid.source, 'operator_baseline',
+    'a synthesised fact must stay distinguishable from a measured one');
 });

@@ -69,8 +69,8 @@ of prompt-discouraged.
 Rename stages and observations. Keep three things:
 
 - **Status is a stage, not an owner.** Who does the work is a column.
-- **Transitions are explicit** (`canAutomatedTransition`), never a bare rank comparison —
-  see GUARDS #22.
+- **Status is projected from milestones** by `projectStatus`, never set by a lane — there is
+  exactly one lifecycle write route (GUARDS #34).
 - **`HANDOFF_ELIGIBLE` excludes your committed-but-not-started stage**, or a quote-check
   reads as a handoff (GUARDS #11).
 
@@ -79,15 +79,27 @@ Worked example — a support-ticket tracker:
 ```js
 const STAGES = ['reported', 'triaged', 'in_progress', 'awaiting_customer', 'resolved'];
 const DEAD_STAGES = ['duplicate', 'wont_fix'];
-const OBSERVATION_STAGE = {
-  ticket_raised:      'reported',
-  triaged:            'triaged',
-  work_started:       'in_progress',
-  info_requested:     'awaiting_customer',
-  fix_shipped:        'resolved',
-  reopened:           'in_progress',
-  marked_duplicate:   'duplicate',
+// Each observation writes ONE durable milestone occurrence {at, seq, message_id}.
+const OBSERVATION_MILESTONE = {
+  ticket_raised:    'raised',
+  triaged:          'triaged',
+  work_started:     'work_started',
+  info_requested:   'info_requested',
+  fix_shipped:      'shipped',
+  reopened:         'reopened',
+  marked_duplicate: 'duplicate',
 };
+
+// Status is a PURE PROJECTION of those facts, in one ordered function. Put your commercial
+// rules here — this is where "cannot be resolved before it was triaged" lives.
+function projectStatus(m) {
+  if (m.duplicate) return 'duplicate';
+  if (!m.triaged) return 'reported';
+  if (m.reopened && (!m.shipped || compareOccurrence(m.reopened, m.shipped) > 0)) return 'in_progress';
+  if (m.shipped) return 'resolved';
+  if (m.info_requested) return 'awaiting_customer';
+  return 'in_progress';
+}
 const HANDOFF_ELIGIBLE = new Set(['triaged', 'in_progress']); // never 'reported'
 ```
 

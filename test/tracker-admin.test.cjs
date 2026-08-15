@@ -3,10 +3,19 @@
 // are tested rather than asserted in prose — v1.0 promised them with no tool at all.
 //
 // GUARDS #32: operators correct FACTS (milestones), never the projection (status).
+// GUARDS #38: the tool resolves evidence itself instead of trusting the caller's assertions.
 
 const test = require('node:test');
 const assert = require('node:assert');
 const { buildPlan, assertFresh, assertUnchanged, normalizeRow } = require('../scripts/tracker-admin.cjs');
+
+// A fake message mirror. at/seq must come from HERE, never from caller-supplied values.
+const MIRROR = {
+  'msg-delivered': { at: '2026-08-02T09:00:00Z', seq: 501, phone: '971500000000' },
+  'msg-other-chat': { at: '2026-08-02T09:00:00Z', seq: 502, phone: '971509999999' },
+};
+const resolver = (id) => MIRROR[id] || null;
+const plan = (snapshot, proposal) => buildPlan(snapshot, proposal, resolver);
 
 const MILESTONES = JSON.stringify({
   committed: { at: '2026-08-01T09:00:00Z', seq: 1, message_id: 'a' },
@@ -25,20 +34,20 @@ const snap = (rows = [ROW]) => ({
 });
 
 test('status cannot be corrected directly — it is a projection', () => {
-  assert.throws(() => buildPlan(snap(), {
+  assert.throws(() => plan(snap(), {
     corrections: [{ record_id: 'R1', fields: { status: 'done' }, note: 'delivered by hand' }],
   }), /status is a projection/);
 });
 
 test('setting a milestone re-projects the status, and writes both together', () => {
-  const plan = buildPlan(snap(), {
+  const p = plan(snap(), {
     corrections: [{
       record_id: 'R1',
-      milestone_ops: { set: { final_delivered: { at: '2026-08-02T09:00:00Z', message_id: 'z' } } },
+      milestone_ops: { set: { final_delivered: { evidence_msg_id: 'msg-delivered' } } },
       note: 'delivered by hand, confirmed in chat',
     }],
   });
-  const w = plan.writes[0];
+  const w = p.writes[0];
   assert.equal(w.after.status, 'done', 'status must follow from the corrected facts');
   assert.ok(w.changed_fields.includes('milestones') && w.changed_fields.includes('status'));
   assert.ok(JSON.parse(w.after.milestones).final_delivered);
@@ -46,75 +55,122 @@ test('setting a milestone re-projects the status, and writes both together', () 
 
 test('clearing a FALSE milestone is possible, and the status follows', () => {
   // The case a status-only correction could never express: a payment that never happened.
-  const plan = buildPlan(snap(), {
+  const p = plan(snap(), {
     corrections: [{ record_id: 'R1', milestone_ops: { clear: ['paid'] }, note: 'payment never arrived' }],
   });
-  assert.equal(plan.writes[0].after.status, 'confirmed_unpaid');
-  assert.ok(!JSON.parse(plan.writes[0].after.milestones).paid);
+  assert.equal(p.writes[0].after.status, 'confirmed_unpaid');
+  assert.ok(!JSON.parse(p.writes[0].after.milestones).paid);
+});
+
+test('GUARDS #38: at/seq come from the mirror, never from the caller', () => {
+  const p = plan(snap(), {
+    corrections: [{
+      record_id: 'R1',
+      // Deliberately bogus assertions alongside the real id — they must be ignored.
+      milestone_ops: {
+        set: { final_delivered: { evidence_msg_id: 'msg-delivered', at: '1999-01-01T00:00:00Z', seq: 7 } },
+      },
+      note: 'x',
+    }],
+  });
+  const stored = JSON.parse(p.writes[0].after.milestones).final_delivered;
+  assert.equal(stored.at, '2026-08-02T09:00:00Z');
+  assert.equal(stored.seq, 501);
+  assert.equal(stored.source, 'evidence');
+});
+
+test('a cited message must exist and belong to this record’s conversation', () => {
+  assert.throws(() => plan(snap(), {
+    corrections: [{ record_id: 'R1', milestone_ops: { set: { paid: { evidence_msg_id: 'nope' } } }, note: 'x' }],
+  }), /not in the message/);
+  assert.throws(() => plan(snap(), {
+    corrections: [{ record_id: 'R1', milestone_ops: { set: { paid: { evidence_msg_id: 'msg-other-chat' } } }, note: 'x' }],
+  }), /DIFFERENT conversation/);
+});
+
+test('a fact with no message evidence must be LABELLED, not disguised', () => {
+  assert.throws(() => plan(snap(), {
+    corrections: [{ record_id: 'R1', milestone_ops: { set: { paid: { at: '2026-06-02T00:00:00Z' } } }, note: 'x' }],
+  }), /requires evidence_msg_id/);
+
+  const p = plan(snap(), {
+    corrections: [{
+      record_id: 'R1',
+      milestone_ops: { set: { paid: { at: '2026-06-02T00:00:00Z', source: 'operator_baseline' } } },
+      note: 'paid by bank transfer; chat history lost',
+    }],
+  });
+  const stored = JSON.parse(p.writes[0].after.milestones).paid;
+  assert.equal(stored.source, 'operator_baseline');
+  assert.equal(stored.seq, null, 'a baseline has no ingestion position');
+});
+
+test('a baseline still needs a parseable timestamp', () => {
+  assert.throws(() => plan(snap(), {
+    corrections: [{
+      record_id: 'R1',
+      milestone_ops: { set: { paid: { at: 'yesterday', source: 'operator_baseline' } } },
+      note: 'x',
+    }],
+  }), /parseable "at" timestamp/);
 });
 
 test('an unknown milestone name is refused', () => {
-  assert.throws(() => buildPlan(snap(), {
+  assert.throws(() => plan(snap(), {
     corrections: [{ record_id: 'R1', milestone_ops: { clear: ['vibes'] }, note: 'x' }],
   }), /unknown milestone/);
-  assert.throws(() => buildPlan(snap(), {
-    corrections: [{ record_id: 'R1', milestone_ops: { set: { vibes: { at: '2026-08-02T09:00:00Z' } } }, note: 'x' }],
+  assert.throws(() => plan(snap(), {
+    corrections: [{ record_id: 'R1', milestone_ops: { set: { vibes: { evidence_msg_id: 'msg-delivered' } } }, note: 'x' }],
   }), /unknown milestone/);
-});
-
-test('a milestone must carry a parseable timestamp', () => {
-  assert.throws(() => buildPlan(snap(), {
-    corrections: [{ record_id: 'R1', milestone_ops: { set: { paid: { at: 'yesterday' } } }, note: 'x' }],
-  }), /parseable "at" timestamp/);
 });
 
 test('corrupt stored milestones can only be repaired by an explicit full replace', () => {
   const corrupt = snap([{ ...ROW, milestones: '{broken' }]);
-  assert.throws(() => buildPlan(corrupt, {
+  assert.throws(() => plan(corrupt, {
     corrections: [{ record_id: 'R1', milestone_ops: { clear: ['paid'] }, note: 'x' }],
   }), /unreadable[\s\S]*replace/);
 
-  const plan = buildPlan(corrupt, {
+  const p = plan(corrupt, {
     corrections: [{
       record_id: 'R1',
       milestone_ops: { replace: { paid: { at: '2026-08-01T10:00:00Z', seq: 2 } } },
       note: 'rebuilt from the chat',
     }],
   });
-  assert.equal(plan.writes[0].after.status, 'paid');
+  assert.equal(p.writes[0].after.status, 'paid');
 });
 
 test('descriptive fields are still correctable, and a null clears one', () => {
-  const plan = buildPlan(snap([{ ...ROW, counterparty: 'vendor-a' }]), {
+  const p = plan(snap([{ ...ROW, counterparty: 'vendor-a' }]), {
     corrections: [{ record_id: 'R1', fields: { counterparty: null, price: 'AED 150' }, note: 'done in house' }],
   });
-  assert.equal(plan.writes[0].after.counterparty, '');
-  assert.equal(plan.writes[0].after.price, 'AED 150');
+  assert.equal(p.writes[0].after.counterparty, '');
+  assert.equal(p.writes[0].after.price, 'AED 150');
 });
 
 test('an unexplained correction is refused — it would be unauditable', () => {
-  assert.throws(() => buildPlan(snap(), {
+  assert.throws(() => plan(snap(), {
     corrections: [{ record_id: 'R1', fields: { price: 'AED 150' } }],
   }), /requires a note/);
 });
 
 test('identity fields and unknown fields cannot be corrected', () => {
-  assert.throws(() => buildPlan(snap(), {
+  assert.throws(() => plan(snap(), {
     corrections: [{ record_id: 'R1', fields: { phone: '9999' }, note: 'x' }],
   }), /not correctable/);
-  assert.throws(() => buildPlan(snap(), {
+  assert.throws(() => plan(snap(), {
     corrections: [{ record_id: 'R1', fields: { nonsense: 'x' }, note: 'x' }],
   }), /not correctable/);
 });
 
 test('a correction targeting a record absent from the snapshot is refused', () => {
-  assert.throws(() => buildPlan(snap(), {
+  assert.throws(() => plan(snap(), {
     corrections: [{ record_id: 'GHOST', fields: { price: 'x' }, note: 'x' }],
   }), /absent from the snapshot/);
 });
 
 test('one record cannot be corrected twice in a single proposal', () => {
-  assert.throws(() => buildPlan(snap(), {
+  assert.throws(() => plan(snap(), {
     corrections: [
       { record_id: 'R1', fields: { price: 'AED 1' }, note: 'a' },
       { record_id: 'R1', fields: { price: 'AED 2' }, note: 'b' },
@@ -123,11 +179,11 @@ test('one record cannot be corrected twice in a single proposal', () => {
 });
 
 test('a no-op correction writes nothing', () => {
-  const plan = buildPlan(snap(), {
+  const p = plan(snap(), {
     corrections: [{ record_id: 'R1', fields: { price: 'AED 100' }, note: 'already correct' }],
   });
-  assert.equal(plan.writes.length, 0);
-  assert.equal(plan.no_op_count, 1);
+  assert.equal(p.writes.length, 0);
+  assert.equal(p.no_op_count, 1);
 });
 
 test('a stale snapshot is refused before any write', () => {
@@ -137,17 +193,17 @@ test('a stale snapshot is refused before any write', () => {
 });
 
 test('optimistic concurrency covers MILESTONES, not just the visible fields', () => {
-  const plan = buildPlan(snap(), {
+  const p = plan(snap(), {
     corrections: [{ record_id: 'R1', fields: { price: 'AED 150' }, note: 'x' }],
   });
-  assert.doesNotThrow(() => assertUnchanged(plan, [ROW]));
-  assert.throws(() => assertUnchanged(plan, [{ ...ROW, status: 'translating' }]), /changed since the snapshot/);
+  assert.doesNotThrow(() => assertUnchanged(p, [ROW]));
+  assert.throws(() => assertUnchanged(p, [{ ...ROW, status: 'translating' }]), /changed since the snapshot/);
   // The automated lane advancing the authoritative state must abort the apply even when
   // every human-visible cell still looks identical.
   const movedFacts = JSON.stringify({
-    ...JSON.parse(MILESTONES), work_started: { at: '2026-08-01T11:00:00Z', seq: 5, message_id: 'c' },
+    ...JSON.parse(MILESTONES),
+    work_started: { at: '2026-08-01T11:00:00Z', seq: 5, message_id: 'c' },
   });
-  assert.throws(() => assertUnchanged(plan, [{ ...ROW, milestones: movedFacts }]),
-    /changed since the snapshot/);
-  assert.throws(() => assertUnchanged(plan, []), /vanished/);
+  assert.throws(() => assertUnchanged(p, [{ ...ROW, milestones: movedFacts }]), /changed since the snapshot/);
+  assert.throws(() => assertUnchanged(p, []), /vanished/);
 });

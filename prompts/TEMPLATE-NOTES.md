@@ -17,7 +17,7 @@ SyntaxError'd the whole watcher for three silent ticks.
 |---|---|---|
 | Input/output JSON schema | **STRUCTURAL** | Must match `scripts/lib/client-result.cjs` exactly. Change both together or every result is rejected. |
 | "YOU DO NOT DECIDE THE STATUS" | **STRUCTURAL — the central boundary** | The model emits **observations**; code derives state. Enforced by validation, which rejects any record carrying a `status`. This is what makes the "Done" and draft traps structurally impossible rather than prompt-discouraged. |
-| THE OBSERVATION VOCABULARY | **DOMAIN names, STRUCTURAL shape** | Rename to your events, but keep every entry a concrete, checkable occurrence — never a state. Must match `OBSERVATION_STAGE` in `status-model.cjs` exactly. |
+| THE OBSERVATION VOCABULARY | **DOMAIN names, STRUCTURAL shape** | Rename to your events, but keep every entry a concrete, checkable occurrence — never a state. Must match `OBSERVATION_MILESTONE` in `status-model.cjs` exactly. |
 | IDENTITY CONTRACT | **STRUCTURAL** | The `kind: new/update` + `order_anchor_id` split is what makes ids stable and repeat customers safe. |
 | "COMMITMENT" definition | **STRUCTURAL shape, DOMAIN examples** | Keep "an affirmative reply AFTER a concrete quote"; swap phrasings for your customers' idioms. **Keep the negative list** — the "polite acknowledgment" trap shipped 8 phantom rows in one run. |
 | Never reuse a terminal id | **STRUCTURAL** | Enforced in code too. The prompt must agree, or every later order gets rejected. |
@@ -50,7 +50,7 @@ SyntaxError'd the whole watcher for three silent ticks.
 3. Verify the output still passes `validateAndNormalizeClientResult`. A prompt change that
    drifts from the schema turns every tick into a deferral, which looks like an outage.
 4. Keep `prompts/` and `scripts/lib/status-model.cjs` in sync. **Every observation type the
-   prompt can emit must exist in `OBSERVATION_STAGE`**, or validation rejects the whole
+   prompt can emit must exist in `OBSERVATION_MILESTONE`**, or validation rejects the whole
    chat's result. That rejection is loud and deferred — which is the intended behaviour, but
    it looks like an outage if you shipped the mismatch.
 5. Never re-introduce a `status` field to the prompt. Validation rejects it on purpose; the

@@ -106,6 +106,94 @@ const normalizeRow = (row) => Object.fromEntries(
   ROW_FIELDS.map((f) => [f, normalizeCell(f, row ? row[f] : '')])
 );
 
+/**
+ * Resolve a milestone occurrence for a correction.
+ *
+ * GUARDS #38 — THE EFFECT BOUNDARY VERIFIES WHAT IT CAN VERIFY. The automated lane never
+ * lets the model supply a timestamp: it cites a message id and deterministic code resolves
+ * `at` and `seq` from the mirror. The correction path must work the same way, or an agent's
+ * three independent assertions (at, seq, message_id) become durable "facts" nobody checked.
+ *
+ * Two explicit modes, and no third:
+ *   EVIDENCE  { evidence_msg_id } -> looked up in the mirror, verified to belong to this
+ *             record's conversation, and its real timestamp/rowid used.
+ *   BASELINE  { at, source: 'operator_baseline' } -> a fact known only to the operator or
+ *             recovered from a lost history. Allowed, but LABELLED as such forever rather
+ *             than dressed up as an observation.
+ */
+function resolveOccurrence(name, occ, recordPhone, resolver) {
+  if (!occ || typeof occ !== 'object' || Array.isArray(occ)) {
+    throw new Error(`milestone ${name} requires an occurrence object`);
+  }
+  const evidenceId = String(occ.evidence_msg_id || occ.message_id || '').trim();
+  const declaredSource = String(occ.source || '').trim();
+
+  if (declaredSource === 'operator_baseline') {
+    const at = String(occ.at || '').trim();
+    if (!at || tsToEpoch(at) === null) {
+      throw new Error(`milestone ${name} baseline requires a parseable "at" timestamp`);
+    }
+    // No seq: there was no ingestion event. The projection treats a missing seq as a genuine
+    // absence of precision rather than as position zero.
+    return { at, seq: null, message_id: evidenceId || 'operator-baseline', source: 'operator_baseline' };
+  }
+
+  if (!evidenceId) {
+    throw new Error(`milestone ${name} requires evidence_msg_id (or source:"operator_baseline" `
+      + 'for a fact with no message evidence)');
+  }
+  if (!resolver) {
+    throw new Error(`milestone ${name} cites evidence but the message mirror is unavailable; `
+      + 'set WHATSAPP_DB_PATH, or use source:"operator_baseline" if the history is gone');
+  }
+  const found = resolver(evidenceId);
+  if (!found) {
+    throw new Error(`milestone ${name} cites message ${evidenceId}, which is not in the message `
+      + 'mirror. Do not assert a timestamp for a message that cannot be found.');
+  }
+  if (recordPhone && found.phone && found.phone !== String(recordPhone).replace(/\D/g, '')) {
+    throw new Error(`milestone ${name} cites message ${evidenceId} from a DIFFERENT conversation `
+      + `(${found.phone}) than the record's (${recordPhone})`);
+  }
+  return { at: found.at, seq: found.seq, message_id: evidenceId, source: 'evidence' };
+}
+
+// Look a message up in the mirror by id, returning its true timestamp, rowid and phone.
+// Returns null (rather than throwing) when the mirror is unreadable, so a correction that
+// needs no evidence still works on a machine without the bridge.
+function createMessageResolver() {
+  const dbPath = process.env.WHATSAPP_DB_PATH || '';
+  if (!dbPath || !fs.existsSync(dbPath)) return null;
+  let db;
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    // readOnly WITH a finite timeout — without one this hangs on the bridge's live writes.
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 5000 });
+  } catch { return null; }
+
+  const waDb = dbPath.replace(/messages\.db$/i, 'whatsapp.db');
+  const lidToPn = new Map();
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    const W = new DatabaseSync(waDb, { readOnly: true, timeout: 5000 });
+    for (const r of W.prepare('SELECT lid, pn FROM whatsmeow_lid_map').all()) {
+      lidToPn.set(String(r.lid), String(r.pn).replace(/\D/g, ''));
+    }
+  } catch { /* the phone check degrades to "unverified"; the lookup itself still works */ }
+
+  return (messageId) => {
+    const row = db.prepare(
+      'SELECT rowid, id, chat_jid, timestamp FROM messages WHERE id = ? ORDER BY rowid DESC LIMIT 1'
+    ).get(String(messageId));
+    if (!row) return null;
+    const jid = String(row.chat_jid || '');
+    const phone = jid.endsWith('@s.whatsapp.net') ? jid.split('@')[0].replace(/\D/g, '')
+      : jid.endsWith('@lid') ? (lidToPn.get(jid.split('@')[0]) || '')
+        : '';
+    return { at: String(row.timestamp), seq: Number(row.rowid), phone, chat_jid: jid };
+  };
+}
+
 function readJson(file, label) {
   if (!file) throw new Error('--' + label + ' is required');
   return JSON.parse(fs.readFileSync(path.resolve(file), 'utf8'));
@@ -135,7 +223,7 @@ async function snapshot(options) {
 
 // Build the exact before/after plan. Pure — no I/O — so it can be reviewed before anything
 // is touched, and unit-tested without a live store.
-function buildPlan(snap, proposal) {
+function buildPlan(snap, proposal, resolver = createMessageResolver()) {
   if (!snap || snap.schema !== 'tracker-admin-snapshot-v1') throw new Error('unsupported snapshot schema');
   if (!proposal || typeof proposal !== 'object') throw new Error('proposal must be an object');
   const corrections = Array.isArray(proposal.corrections) ? proposal.corrections : [];
@@ -203,15 +291,7 @@ function buildPlan(snap, proposal) {
       }
       for (const [name, occ] of Object.entries(ops.set || {})) {
         if (!MILESTONES.includes(name)) throw new Error('unknown milestone: ' + name);
-        const at = String((occ && occ.at) || '').trim();
-        if (!at || tsToEpoch(at) === null) {
-          throw new Error(`milestone ${name} requires a parseable "at" timestamp`);
-        }
-        milestones[name] = {
-          at,
-          seq: Number.isFinite(Number(occ.seq)) ? Number(occ.seq) : null,
-          message_id: String(occ.message_id || ''),
-        };
+        milestones[name] = resolveOccurrence(name, occ, before.phone, resolver);
       }
 
       // Write the facts AND the status they project, together, so the two can never disagree.
@@ -367,7 +447,10 @@ async function main(argv = process.argv.slice(2)) {
   if (command === 'help' || options.help) { console.log(usage()); return; }
   if (command === 'snapshot') return writeOut(await snapshot(options), options.output);
   if (command === 'validate') {
-    return writeOut(buildPlan(readJson(options.snapshot, 'snapshot'), readJson(options.proposal, 'proposal')), options.output);
+    return writeOut(
+      buildPlan(readJson(options.snapshot, 'snapshot'), readJson(options.proposal, 'proposal')),
+      options.output
+    );
   }
   if (command === 'apply') return writeOut(await apply(options), options.output);
   if (command === 'inspect') return writeOut(await inspect(options.record), options.output);

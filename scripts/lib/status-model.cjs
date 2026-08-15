@@ -41,7 +41,6 @@ const STAGES = [
 const DEAD_STAGES = ['cancelled', 'refunded'];
 
 const VALID_STATUS = new Set([...STAGES, ...DEAD_STAGES]);
-const STATUS_RANK = Object.fromEntries([...STAGES, ...DEAD_STAGES].map((n, i) => [n, i]));
 const TERMINAL_STATUS = new Set(['done', ...DEAD_STAGES]);
 
 // ---- Observations (what the MODEL is allowed to say) ----------------------------------
@@ -91,9 +90,21 @@ function tsToEpoch(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// `seq` is optional (a v1.2.0 milestone or an operator baseline has none). Read it WITHOUT
+// coercing absence into a number: Number(null) is 0 and Number.isFinite(0) is true, so a
+// naive read silently sorted an unknown-order legacy fact as the EARLIEST possible event.
+function seqOf(occurrence) {
+  if (!occurrence || occurrence.seq === null || occurrence.seq === undefined || occurrence.seq === '') return null;
+  const n = Number(occurrence.seq);
+  return Number.isFinite(n) ? n : null;
+}
+
 /**
  * Order two occurrences: timestamp first, ingestion `seq` as the deterministic tiebreak.
- * Returns >0 if `a` is later, <0 if earlier, 0 if genuinely indistinguishable.
+ * Returns >0 if `a` is later, <0 if earlier, 0 if indistinguishable.
+ *
+ * A 0 here means "cannot be distinguished", which is NOT the same as "simultaneous".
+ * Use `orderingIsAmbiguous` before relying on the result for a decision.
  */
 function compareOccurrence(a, b) {
   const ea = a ? tsToEpoch(a.at) : null;
@@ -102,10 +113,29 @@ function compareOccurrence(a, b) {
   if (ea === null) return -1;
   if (eb === null) return 1;
   if (ea !== eb) return ea > eb ? 1 : -1;
-  const sa = Number.isFinite(Number(a.seq)) ? Number(a.seq) : null;
-  const sb = Number.isFinite(Number(b.seq)) ? Number(b.seq) : null;
+  const sa = seqOf(a);
+  const sb = seqOf(b);
   if (sa === null || sb === null || sa === sb) return 0;
   return sa > sb ? 1 : -1;
+}
+
+/**
+ * True when two occurrences share a timestamp and their order CANNOT be established because
+ * at least one lacks ingestion precision (GUARDS #33).
+ *
+ * This is the mixed-precision hole a v1.2.0 store can carry: a bare-timestamp milestone
+ * compared against a fresh one at the exact same second. The order is genuinely unknowable,
+ * and guessing decides whether a customer's correction request is honoured or discarded — so
+ * callers must refuse rather than pick.
+ */
+function orderingIsAmbiguous(a, b) {
+  if (!a || !b) return false;
+  const ea = tsToEpoch(a.at);
+  const eb = tsToEpoch(b.at);
+  if (ea === null || eb === null || ea !== eb) return false;
+  const sa = seqOf(a);
+  const sb = seqOf(b);
+  return sa === null || sb === null;
 }
 
 function normalizeOccurrence(value, milestone) {
@@ -125,8 +155,12 @@ function normalizeOccurrence(value, milestone) {
   if (!at || tsToEpoch(at) === null) {
     throw new MilestoneStateError(`milestone ${milestone} has no usable timestamp`);
   }
-  const seq = Number.isFinite(Number(value.seq)) ? Number(value.seq) : null;
-  return { at, seq, message_id: String(value.message_id || '') };
+  const occurrence = { at, seq: seqOf(value), message_id: String(value.message_id || '') };
+  // `source` distinguishes an observed fact from an operator baseline (a fact with no message
+  // evidence). It must survive every round trip, or a synthesised timestamp becomes
+  // indistinguishable from a measured one — see docs/MIGRATION.md.
+  if (value.source) occurrence.source = String(value.source);
+  return occurrence;
 }
 
 /**
@@ -222,6 +256,15 @@ function projectStatus(milestones) {
   if (m.refunded) return 'refunded';
   if (m.cancelled) return 'cancelled';
   if (!m.paid) return 'confirmed_unpaid';
+  if (m.revision && m.final_delivered && orderingIsAmbiguous(m.revision, m.final_delivered)) {
+    // Refuse to guess: this decides whether a customer's correction request is honoured or
+    // silently discarded. Migrate the legacy occurrence (docs/MIGRATION.md) to resolve it.
+    throw new MilestoneStateError(
+      'cannot order revision against final_delivered: identical timestamps and at least one '
+      + 'occurrence lacks ingestion precision (a pre-v1.2.1 milestone). Migrate that milestone '
+      + 'before this record can be projected.'
+    );
+  }
   if (m.revision && (!m.final_delivered || compareOccurrence(m.revision, m.final_delivered) > 0)) {
     return 'revision';
   }
@@ -230,35 +273,21 @@ function projectStatus(milestones) {
   return 'paid';
 }
 
-/**
- * Whether an AUTOMATED lane may move `current` -> `next`.
- *
- * With milestone projection the monotonic guard is largely IMPLICIT — milestones only
- * accumulate, so a stale re-read cannot walk a record backwards. This remains the explicit
- * gate for refusing to reopen a terminal record.
- *
- * An operator correction does NOT pass through here: a human corrects the underlying FACTS
- * (see tracker-admin milestone_ops), and the status re-projects from them.
- */
-function canAutomatedTransition(current, next) {
-  if (!VALID_STATUS.has(next)) return { allowed: false, reason: 'invalid_target:' + next };
-  if (isBlank(current)) return { allowed: true, reason: 'creation' };
-  if (!VALID_STATUS.has(current)) return { allowed: false, reason: 'unrankable_current:' + current };
-  if (current === next) return { allowed: false, reason: 'no_op' };
-  if (DEAD_STAGES.includes(current)) {
-    return current === 'cancelled' && next === 'refunded'
-      ? { allowed: true, reason: 'cancelled_to_refunded' }
-      : { allowed: false, reason: 'terminal_dead:' + current };
-  }
-  if (current === 'done') {
-    return ['revision', 'cancelled', 'refunded'].includes(next)
-      ? { allowed: true, reason: 'post_completion' }
-      : { allowed: false, reason: 'cannot_reopen_completed:' + next };
-  }
-  if (STATUS_RANK[next] > STATUS_RANK[current]) return { allowed: true, reason: 'forward' };
-  if (DEAD_STAGES.includes(next)) return { allowed: true, reason: 'terminal_dead' };
-  return { allowed: false, reason: 'downgrade_refused:' + current + '->' + next };
-}
+// ============================================================================
+// THERE IS EXACTLY ONE LIFECYCLE WRITE ROUTE (GUARDS #34):
+//
+//     observations / operator fact-corrections  ->  milestones  ->  projectStatus
+//
+// v1.2.1 still carried `canAutomatedTransition` and `STATUS_RANK` from the status-authority
+// era, plus a `directStatus` path in the writer that could set a status without touching a
+// milestone. No producer fed it — the validator rejects a model-emitted status and the
+// counterparty lane emits `work_started` — so it was a dormant bypass around the thing that
+// had just been declared authoritative. Both are deleted rather than maintained.
+//
+// The monotonic guard is now IMPLICIT: milestones only accumulate, so a stale re-read cannot
+// walk a record backwards. Refusing to reopen a terminal record lives in the projection and
+// in the validator's terminal check.
+// ============================================================================
 
 module.exports = {
   DEAD_STAGES,
@@ -269,13 +298,13 @@ module.exports = {
   OBSERVATION_MILESTONE,
   RECORD_FIELDS,
   STAGES,
-  STATUS_RANK,
   TERMINAL_STATUS,
   VALID_STATUS,
-  canAutomatedTransition,
   compareOccurrence,
   mergeMilestones,
+  orderingIsAmbiguous,
   parseMilestones,
   projectStatus,
+  seqOf,
   tsToEpoch,
 };

@@ -36,10 +36,15 @@ const ROOT = path.join(__dirname, '..');
 const STATE = path.join(ROOT, 'tracker-state.json');
 const WORKDIR = path.join(ROOT, '.tracker-work');
 
-// Budget for NEW messages per chat. Exceeding it lowers the boundary; it never truncates.
-const MAX_NEW = Number(process.env.TRACKER_MAX_NEW_MSGS || 150);
-// Cap for historical CONTEXT, which is safe to truncate — it can never justify a write.
-const MAX_CONTEXT = Number(process.env.TRACKER_MAX_CONTEXT_MSGS || 150);
+// Budgets are read AFTER .env loads, inside main() — see the loadEnv call below.
+//
+// GUARDS #39: these used to be read at module scope, before `loadConfig()` had loaded `.env`.
+// The scheduled lane happened to work because the watcher loads `.env` in the parent process
+// and prep inherits it; running `npm run prep` directly silently used the defaults instead.
+// "Works scheduled, differs manually" is exactly the class of seam that makes a bug
+// impossible to reproduce by hand.
+let MAX_NEW;
+let MAX_CONTEXT;
 
 const canon = (s) => String(s || '').replace(/\D/g, '');
 const fail = (msg) => { console.error('prep ABORT: ' + msg); process.exit(1); };
@@ -64,6 +69,16 @@ const toRow = (m, from, isNew) => ({
   const { fetchRows } = await import('file://' + path.join(ROOT, 'src', 'sheet.js').replace(/\\/g, '/'));
   const cfg = loadConfig();
   if (!cfg.dbPath) fail('WHATSAPP_DB_PATH is not set (see .env)');
+
+  MAX_NEW = cfg.maxNewMsgs;
+  MAX_CONTEXT = cfg.maxContextMsgs;
+  // The watcher refuses to truncate new evidence, so its per-chat budget must be able to
+  // carry whatever prep lets through. Catching the mismatch here beats discovering it as a
+  // deferred chat at 3am.
+  if (cfg.maxMsgs < MAX_NEW) {
+    fail(`TRACKER_MAX_MSGS (${cfg.maxMsgs}) is below TRACKER_MAX_NEW_MSGS (${MAX_NEW}); `
+      + 'the watcher would abort rather than truncate new evidence. Raise the former or lower the latter.');
+  }
 
   const MSG_DB = cfg.dbPath;
   const WA_DB = MSG_DB.replace(/messages\.db$/i, 'whatsapp.db');

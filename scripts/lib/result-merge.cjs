@@ -1,38 +1,32 @@
 'use strict';
-// result-merge.cjs — cross-pass precedence.
+// result-merge.cjs — how the counterparty lane contributes to a record.
 //
-// The counterparty pass records WHO is doing the work (the `counterparty` column) and
-// observes that work has started. It must NEVER overwrite a terminal outcome the CUSTOMER
-// pass produced in the SAME run.
+// WHAT THIS NO LONGER DOES (GUARDS #35): it used to DISCARD the counterparty contribution
+// whenever the customer pass had emitted a "terminal" observation in the same tick. That
+// suppression belonged to the direct-status era, where a counterparty stamp could overwrite a
+// completed record's status (GUARDS #10). Two things have since made it not merely
+// unnecessary but wrong:
 //
-// PRODUCTION FAILURE (docs/GUARDS.md #10): in a single run the counterparty pass stamped an
-// in-progress status onto a record the customer pass had already completed, leaving finished
-// work showing as needing attention. Hit 3 real rows.
+//   1. `final_delivered` is no longer terminal by itself — delivery while unpaid keeps the
+//      record in the chase-payment stage, so suppressing on it discarded valid work facts
+//      from ordinary early-delivery jobs.
+//   2. The writer now emits exactly ONE row per record per tick, merging every lane's
+//      observations and projecting once (GUARDS #30). Ordering is resolved by the
+//      projection, not by which lane wrote last, so there is nothing left to protect.
 //
-// Since v1.2 a counterparty update carries a `work_started` OBSERVATION rather than a status,
-// so both lanes flow through the same milestone projection. The precedence check below stays
-// because it is cheaper and clearer to refuse the update here than to rely on the projection
-// ordering it correctly.
+// `work_started` and the counterparty's identity are TRUE HISTORICAL FACTS. Even on a record
+// that ends cancelled or refunded, "Vendor A did the work" is worth keeping — the projection
+// still returns the terminal status, because terminal-dead outcomes win there.
+//
+// So this file simply records the contribution. The lifecycle decision is made in exactly one
+// place: projectStatus.
 
-const TERMINAL_OBSERVATIONS = new Set(['final_delivered', 'order_cancelled', 'payment_refunded']);
-
-// Did the customer pass produce a terminal outcome for this record in THIS run?
-function hasTerminalRecord(results, recordId) {
-  return results.some((entry) => (entry.records || []).some((record) => {
-    if (!record || record.record_id !== recordId) return false;
-    if (record.status === 'done') return true; // a pre-derived status (legacy shape)
-    return (record.observations || []).some((o) => TERMINAL_OBSERVATIONS.has(o && o.type));
-  }));
-}
-
-// Push a counterparty update into results, unless the customer pass already produced a
-// terminal outcome for that record this run.
+// Append a counterparty contribution ({record_id, counterparty, observation}) to the results.
+// The writer aggregates by record_id afterwards, so appending a second entry for a record the
+// customer pass already touched is correct and safe.
 function mergeCounterpartyUpdate(results, recordId, counterparty, observation) {
   if (typeof recordId !== 'string' || !recordId || !counterparty || !observation || !observation.type) {
     return { added: false, reason: 'invalid_update' };
-  }
-  if (hasTerminalRecord(results, recordId)) {
-    return { added: false, reason: 'customer_pass_terminal' };
   }
   results.push({
     phone: recordId.split('_')[0],
@@ -41,4 +35,4 @@ function mergeCounterpartyUpdate(results, recordId, counterparty, observation) {
   return { added: true, reason: 'appended' };
 }
 
-module.exports = { TERMINAL_OBSERVATIONS, hasTerminalRecord, mergeCounterpartyUpdate };
+module.exports = { mergeCounterpartyUpdate };

@@ -525,6 +525,102 @@ honour. A correction path that edits a derived view is a correction that does no
 
 ---
 
+---
+
+## #33 — Mixed-precision ordering was guessed instead of refused
+
+A v1.2.0 milestone carries no `seq`. Compared against a fresh occurrence at the **exact same
+timestamp**, the order is genuinely unknowable — and it decides whether a customer's
+correction request is honoured or discarded.
+
+Worse than guessing: `Number(null)` is `0` and `Number.isFinite(0)` is `true`, so the naive
+read sorted an unknown-order legacy fact as the **earliest possible event**.
+
+**Guard:** `seqOf` treats absence as `null`, and `orderingIsAmbiguous` detects the tie.
+`projectStatus` **throws** rather than pick, naming the milestone to migrate.
+
+---
+
+## #34 — A dormant status-authority bypass survived the milestone cutover
+
+`tracker-apply` still collected a lane-supplied `status` into `directStatus` and could write
+it without touching a milestone, guarded by `canAutomatedTransition`/`STATUS_RANK`. No
+producer fed it — the validator rejects a model-emitted status, and the counterparty lane
+emits `work_started` — so it was an unused route **around** the thing just declared
+authoritative.
+
+**Guard:** deleted. Exactly one lifecycle write route:
+`observations / operator fact-corrections → milestones → projectStatus`. Leaving a legacy
+bypass "just in case" contradicts the authority model and invites a future caller.
+
+---
+
+## #35 — Obsolete cross-pass suppression discarded true facts
+
+`result-merge` still refused the whole counterparty contribution when the customer pass
+emitted a "terminal" observation. That belonged to the direct-status era (#10). Two things
+made it wrong: `final_delivered` is no longer terminal by itself (delivery while unpaid keeps
+the record in chase-payment), and the single-write aggregator plus projection already resolve
+ordering safely.
+
+So an ordinary early-delivery job silently lost "Vendor A did this work" — a true historical
+fact, worth keeping even on a cancelled order.
+
+**Guard:** the suppression is deleted. The lifecycle decision happens in exactly one place.
+
+---
+
+## #36 — A derived column drifted from the fact it derives from
+
+`Records.paid_at` was populated from `milestones.paid` but never **cleared** when that fact
+went away. Clearing a false payment left a row reading `confirmed_unpaid` **and** `paid at X`
+— and prep feeds `paid_at` back to the model as authoritative context.
+
+**Guard:** `paid_at` is explicitly a projection. Every write sets it *or* clears it alongside
+the milestone. A derived value must be written by the same code path that owns its source.
+
+---
+
+## #37 — Reviews carried a lighter evidence burden than writes
+
+The counterparty prompt required `evidence_msg_ids` for both updates and reviews, but only
+updates were checked. A review citing an old or hallucinated id could raise a false
+cancellation alarm about a live order.
+
+**Guard:** reviews resolve their cited ids against the same new-message set. Unresolvable →
+logged and dropped, no alert. An alert is an effect; effects need evidence.
+
+---
+
+## #38 — The correction path trusted assertions the automated path verifies
+
+`milestone_ops.set` accepted `{at, seq, message_id}` as three independent claims. The
+automated lane never works that way: the model cites a message **id** and deterministic code
+resolves the timestamp and ingestion position from the mirror.
+
+**Guard:** corrections cite `evidence_msg_id`; the tool looks it up, verifies it belongs to
+that record's conversation, and takes the real values. A fact with no message evidence must
+declare `source: "operator_baseline"` and is labelled as such forever.
+
+**Meta-lesson:** the effect boundary should independently verify whatever it *can* verify,
+rather than trusting the caller — including when the caller is an agent you wrote.
+
+---
+
+## #39 — Config read before config was loaded
+
+`tracker-prep` read its budgets at module scope, before `loadConfig()` had loaded `.env`. The
+scheduled lane worked because the watcher loads `.env` in the parent and prep inherits it;
+running `npm run prep` by hand silently used the defaults.
+
+"Works scheduled, differs manually" makes a bug impossible to reproduce by hand — the worst
+property an operational tool can have.
+
+**Guard:** budgets come from `loadConfig()` inside `main()`, and prep now enforces the
+required relationship (`TRACKER_MAX_MSGS >= TRACKER_MAX_NEW_MSGS`) at startup.
+
+---
+
 ## The meta-lessons
 
 1. **Never advance a cursor over a message you did not show the model.** Every

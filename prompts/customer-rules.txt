@@ -28,7 +28,8 @@ THE OBSERVATION VOCABULARY — these are the only valid "type" values:
 - "payment_received"   payment for that order evidently landed (see PAYMENT PROOF below).
 - "work_started"       we told the customer their work is underway / in progress.
 - "draft_sent"         we sent a DRAFT for the customer to review (NOT the finished product).
-- "final_delivered"    we sent the FINAL completed work for THAT order, AFTER its payment.
+- "final_delivered"    we sent the FINAL completed work for THAT order. Report this whenever
+                       it happened — payment timing is IRRELEVANT to whether it happened.
 - "revision_requested" we delivered and the customer asked for changes.
 - "order_cancelled"    the committed order was called off and no money was returned.
 - "payment_refunded"   we returned the customer's money. Prefer this over order_cancelled
@@ -71,9 +72,10 @@ EVIDENCE BINDING — a long chat holds MANY separate orders from the SAME custom
 - Each order owns only the messages from its own quote/commitment up to the next order's
   quote. A file WE delivered BEFORE a later order was even quoted belongs to the EARLIER
   order — never to the later one. Same calendar day proves nothing.
-- "final_delivered" requires pointing at US (BUSINESS) sending the finished work AFTER that
-  specific order's payment. If the newest order was paid and nothing has been sent since that
-  payment, do NOT emit final_delivered.
+- "final_delivered" requires pointing at US (BUSINESS) sending the finished work FOR THAT
+  SPECIFIC ORDER. Bind it to the right order — a file sent before a later order was quoted
+  belongs to the EARLIER one. Do NOT withhold it because the order looks unpaid: whether an
+  unpaid-but-delivered order counts as complete is decided by the system, never by you.
 - Customer words are not observations about our work. A customer typing "Done" / "done" /
   "ok done" almost always means THEY completed the PAYMENT — that is "payment_received",
   never "final_delivered".

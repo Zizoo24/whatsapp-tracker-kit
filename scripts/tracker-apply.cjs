@@ -21,8 +21,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
-  MilestoneStateError, VALID_STATUS, canAutomatedTransition, compareOccurrence,
-  mergeMilestones, projectStatus,
+  MilestoneStateError, compareOccurrence, mergeMilestones, projectStatus,
 } = require('./lib/status-model.cjs');
 const { advanceCursorState } = require('./lib/message-cursor.cjs');
 
@@ -54,8 +53,10 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
         process.exit(1);
       }
       const id = String(d.record_id);
+      // NOTE: a lane-supplied `status` is deliberately NOT collected. There is exactly one
+      // lifecycle write route — observations -> milestones -> projection (GUARDS #34).
       const agg = byRecord.get(id) || {
-        record_id: id, phone, fields: {}, observations: [], counterparty: '', directStatus: '',
+        record_id: id, phone, fields: {}, observations: [], counterparty: '',
       };
       if (phone) agg.phone = agg.phone || phone;
       for (const f of ['start_date', 'client_name', 'doc_type', 'language_pair', 'price', 'delivery_time', 'summary']) {
@@ -64,7 +65,6 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
       }
       if (d.counterparty) agg.counterparty = d.counterparty;
       if (Array.isArray(d.observations)) agg.observations.push(...d.observations);
-      if (d.status) agg.directStatus = d.status;
       byRecord.set(id, agg);
     }
   }
@@ -139,20 +139,35 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
       for (const r of merged.refused) {
         console.log(`guard: ${agg.record_id} refused ${r.observation} (${r.reason})`);
       }
-      const status = projectStatus(merged.milestones);
-      // The milestones column is the machine-readable truth; `status` is the human view
-      // projected from it. Both are written together so they can never disagree.
+      let status;
+      try {
+        status = projectStatus(merged.milestones);
+      } catch (e) {
+        if (e instanceof MilestoneStateError) {
+          // An ordering the data cannot establish (GUARDS #33). Guessing here decides whether
+          // a customer's correction request is honoured, so refuse and surface it.
+          console.error(`ABORT: ${agg.record_id} ${e.message}`);
+          blocked++;
+          continue;
+        }
+        throw e;
+      }
+      // The milestones column is the machine-readable truth; `status` and `paid_at` are human
+      // views projected from it. All three are written together so they can never disagree.
       row.milestones = JSON.stringify(merged.milestones);
       row.status = status;
-      if (merged.milestones.paid) row.paid_at = merged.milestones.paid.at;
+      // GUARDS #36: paid_at is DERIVED. It must be cleared when the paid fact goes away, or
+      // a row can read "unpaid" and "paid at X" simultaneously — and prep feeds that stale
+      // value straight back to the model as authoritative context.
+      if (merged.milestones.paid) {
+        row.paid_at = merged.milestones.paid.at;
+      } else {
+        row.paid_at = '';
+        row.clear_fields = [...(row.clear_fields || []), 'paid_at'];
+      }
       if (status !== currentStatus) {
         console.log(`  ${agg.record_id}: ${currentStatus || '(new)'} -> ${status}`);
       }
-    } else if (agg.directStatus) {
-      // A lane supplying a status with no observations must still clear the explicit gate.
-      const verdict = canAutomatedTransition(currentStatus || null, agg.directStatus);
-      if (VALID_STATUS.has(agg.directStatus) && verdict.allowed) row.status = agg.directStatus;
-      else console.log(`guard: ${agg.record_id} kept "${currentStatus}" (${verdict.reason})`);
     }
 
     rows.push(row);

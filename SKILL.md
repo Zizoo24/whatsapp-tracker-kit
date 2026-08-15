@@ -128,8 +128,8 @@ semantics. These *are* the correctness of the system.
    `prompts/TEMPLATE-NOTES.md` marks each paragraph STRUCTURAL or DOMAIN.
 2. **Lifecycle model** (`scripts/lib/status-model.cjs`) — stages, observations, and the
    reducer. Keep: status is a stage not an owner; transitions are explicit via
-   `canAutomatedTransition`, never a bare rank comparison (GUARDS #22); `HANDOFF_ELIGIBLE`
-   excludes your committed-but-unstarted stage (GUARDS #11).
+   the projection (`projectStatus`), never a status set by any lane (GUARDS #34);
+   `HANDOFF_ELIGIBLE` excludes your committed-but-unstarted stage (GUARDS #11).
 3. **Store schema** (`apps-script/Code.gs` → `SHEETS`) — a column must appear in **both**
    `headers` and `merge`, or it is created and then never populated.
 4. **Counterparties** (`counterparty.cjs`) — delete if you don't outsource.
@@ -159,7 +159,7 @@ scripts/
     client-result.cjs        fail-closed validation + stable record-id minting.
     agent-provider.cjs       provider chain (claude | codex | any command).
     bridge-supervisor.cjs    health-probe supervision + restart budget + escalation.
-    result-merge.cjs         cross-pass precedence (terminal beats a side-channel).
+    result-merge.cjs         records the counterparty lane's contribution.
     counterparty.cjs         SEAM — the vendor/counterparty registry.
     counterparty-heuristic.cjs  optional deterministic fallback (domain example, OFF).
     sheet-normalize.cjs      comparison scaffolding for the agent lane (not on the tick path).
@@ -177,7 +177,7 @@ docs/                        ARCHITECTURE, GUARDS, PORTING, LEDGER-ARCHITECTURE
 
 `npm test` runs the suite. Four of its assertions are **architectural boundaries** that
 fail the moment someone erodes them: the keepalive naming any webhook action but
-`heartbeat`, the monotonic guard appearing in the store API, the run lock moving inside the
+`heartbeat`, status derivation appearing in the store API, the run lock moving inside the
 wiped work directory, or a live SQLite read losing its finite timeout.
 
 ---
@@ -191,9 +191,9 @@ cursor and the run lock.
 audits, ambiguity, post-outage recovery. An agent reads the conversation and decides;
 deterministic tooling does snapshot / validate / backup / write / readback.
 
-> **The applies do not share a lock.** Before any agent-lane write: disable the scheduled
-> task → wait for `.tracker-lock` to clear → apply → re-enable. Two writers on one store
-> is the split-brain that costs a day of reconciliation.
+> **Both lanes take the same `.tracker-lock`.** `tracker-admin apply` acquires the writer
+> lock, so a scheduled tick cannot overlap a correction — safety is enforced, not advised.
+> Stopping the scheduled task is still tidier for a long investigation session.
 
 **Transport is separate from semantics.** `bridge-keepalive.cjs` keeps the socket alive
 and does nothing else. In the source system the self-heal lived *inside* the watcher, so
@@ -257,9 +257,9 @@ investigate that specific chat.
 - **Every store-wide mutation carries a row-scope guard** so history rows aren't
   clobbered (GUARDS #7).
 - **Test bridge/binary changes off the live bridge.** Keep a `.bak` before swapping.
-- **The monotonic guard belongs at the sole automated writer, never in the API layer.**
-  `doPost` is also the *correction* path: fixing a wrong terminal status requires posting
-  a backward move, which an API-layer guard would refuse (GUARDS #13).
+- **Status is derived, never set.** Exactly one lifecycle write route: observations (or
+  operator fact-corrections) → milestones → `projectStatus`. The store API stays a dumb
+  upsert, because it is also the correction path (GUARDS #13, #34).
 
 ---
 

@@ -326,8 +326,22 @@ const extractCounterparty = (file) => extractFile(file, COUNTERPARTY_RULES,
       // a record on second-hand evidence is exactly the kind of irreversible action an
       // automated lane must not take. The reason is pinned to the exact string the prompt
       // mandates, so a model-invented reason cannot reach an operator alert.
-      const reviews = (res.reviews || []).filter((u) => u && eligible[u.record_id]
-        && u.reason === 'counterparty_reports_customer_cancelled');
+      //
+      // GUARDS #37: reviews carry the SAME evidence burden as updates. The prompt requires
+      // evidence_msg_ids for both, but only updates were checked — so a review citing an old
+      // or hallucinated id could raise a false cancellation alarm about a live order.
+      const reviews = (res.reviews || []).filter((u) => {
+        if (!u || !eligible[u.record_id]) return false;
+        if (u.reason !== 'counterparty_reports_customer_cancelled') return false;
+        const ids = Array.isArray(u.evidence_msg_ids) ? u.evidence_msg_ids.map(String) : [];
+        const resolved = ids.filter((id) => newById.has(id));
+        if (!resolved.length) {
+          log('  counterparty:' + v.counterparty + ' ignored cancellation review for '
+            + u.record_id + ' (no resolvable evidence_msg_ids)');
+          return false;
+        }
+        return true;
+      });
       if (reviews.length) {
         log('  counterparty:' + v.counterparty + ': ' + reviews.length + ' cancellation review(s); no automatic void');
         alert('counterparty-cancellation-' + v.counterparty,
