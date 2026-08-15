@@ -65,7 +65,9 @@ function inferUniqueHandoffs(input) {
   if (!evidenceId) return [];
   return [{
     record_id: String(candidates[0].record_id),
-    evidence_msg_id: evidenceId,
+    // Same shape the model must return, so the caller resolves timestamps identically for
+    // both sources rather than special-casing this one.
+    evidence_msg_ids: [evidenceId],
     evidence: 'new BUSINESS directive uniquely matched the sole eligible record of that type',
   }];
 }

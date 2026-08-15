@@ -22,14 +22,31 @@
 //   node scripts/tracker-admin.cjs apply    --snapshot FILE --proposal FILE --confirm APPROVED --agent NAME
 //   node scripts/tracker-admin.cjs inspect  --record RECORD_ID
 //
+// OPERATORS CORRECT FACTS, NOT THE PROJECTION (GUARDS #32).
+//
+// `status` is derived from milestones, so setting it directly produces a correction that the
+// next real observation silently erases — and it gives no way to remove a FALSE milestone
+// (e.g. a payment that never happened). Corrections therefore target the milestones, and the
+// status re-projects from them. That is the same truth-ownership rule the automated lane
+// follows: whatever is declared authoritative is what every write path must edit.
+//
 // Proposal shape:
-//   { "corrections": [ { "record_id": "...", "fields": {"status":"done","counterparty":null},
-//                        "note": "why — required" } ] }
-//   A JSON null CLEARS a field. `record_id` and `phone` can never be changed.
+//   { "corrections": [ {
+//       "record_id": "...",
+//       "fields": { "price": "AED 150", "counterparty": null },     // optional, non-status
+//       "milestone_ops": {
+//         "set":   { "final_delivered": { "at": "2026-08-15T11:00:00Z", "message_id": "..." } },
+//         "clear": ["paid"]
+//       },
+//       "note": "why — required"
+//   } ] }
+//   A JSON null CLEARS a field. `record_id`, `phone` and `status` can never be set directly.
 
 const fs = require('fs');
 const path = require('path');
-const { VALID_STATUS, RECORD_FIELDS } = require('./lib/status-model.cjs');
+const {
+  MILESTONES, MilestoneStateError, RECORD_FIELDS, parseMilestones, projectStatus, tsToEpoch,
+} = require('./lib/status-model.cjs');
 const { normalizeCell } = require('./lib/sheet-normalize.cjs');
 const { loadEnv } = require('./lib/agent-provider.cjs');
 const { acquireRunLock, releaseRunLock } = require('./lib/run-lock.cjs');
@@ -43,12 +60,14 @@ const BACKUP_DIR = path.join(ROOT, 'backups');
 const LOCK = path.join(ROOT, '.tracker-lock');
 const MAX_SNAPSHOT_AGE_MIN = 60;
 
-// Fields a human may correct. `status` is included precisely because an operator must be
-// able to move a record BACKWARD — the automated guard forbids that, which is why the guard
-// lives at the writer and not in the store API.
-const CORRECTABLE = new Set([...RECORD_FIELDS, 'status', 'counterparty', 'source_date']);
+// Descriptive fields a human may correct directly. `status` is deliberately ABSENT — it is a
+// projection, and correcting a projection is how a fix silently disappears on the next
+// observation. Use milestone_ops instead.
+const CORRECTABLE = new Set([...RECORD_FIELDS, 'counterparty', 'source_date']);
+// `milestones` is included so the concurrency check, backup and readback all cover the
+// authoritative state — not just the human-facing view derived from it.
 const ROW_FIELDS = ['record_id', 'source_date', 'client_name', 'phone', 'doc_type',
-  'language_pair', 'price', 'delivery_time', 'status', 'summary', 'counterparty'];
+  'language_pair', 'price', 'delivery_time', 'status', 'summary', 'counterparty', 'milestones'];
 
 const canon = (v) => String(v || '').replace(/\D/g, '');
 
@@ -140,21 +159,64 @@ function buildPlan(snap, proposal) {
     // a mistake, so the note is mandatory.
     if (!note) throw new Error('correction requires a note explaining why: ' + id);
 
-    const fields = c.fields;
-    if (!fields || typeof fields !== 'object' || Array.isArray(fields) || !Object.keys(fields).length) {
-      throw new Error('correction requires a non-empty fields object: ' + id);
+    const fields = (c && c.fields) || {};
+    if (typeof fields !== 'object' || Array.isArray(fields)) {
+      throw new Error('correction fields must be an object: ' + id);
+    }
+    if (!Object.keys(fields).length && !c.milestone_ops) {
+      throw new Error('correction requires fields and/or milestone_ops: ' + id);
     }
 
     const after = { ...before };
     for (const [field, value] of Object.entries(fields)) {
-      if (!CORRECTABLE.has(field)) throw new Error('field is not correctable: ' + field);
       if (field === 'status') {
-        if (value === null) throw new Error('status cannot be cleared, only changed');
-        if (!VALID_STATUS.has(String(value))) throw new Error('invalid status: ' + value);
-        after.status = String(value);
-      } else {
-        after[field] = value === null ? '' : normalizeCell(field, value);
+        throw new Error('status is a projection of milestones and cannot be set directly; '
+          + 'use milestone_ops (a status correction would vanish on the next observation)');
       }
+      if (!CORRECTABLE.has(field)) throw new Error('field is not correctable: ' + field);
+      after[field] = value === null ? '' : normalizeCell(field, value);
+    }
+
+    // ---- Milestone operations: the real correction path -------------------------------
+    const ops = c.milestone_ops;
+    if (ops) {
+      if (typeof ops !== 'object' || Array.isArray(ops)) throw new Error('milestone_ops must be an object');
+      let milestones;
+      try {
+        milestones = parseMilestones(before.milestones);
+      } catch (e) {
+        if (e instanceof MilestoneStateError) {
+          // A corrupt cell is repairable ONLY by replacing the whole set, so the operator
+          // must say so explicitly rather than accidentally building on unreadable state.
+          if (!ops.replace) {
+            throw new Error(`stored milestones for ${id} are unreadable (${e.message}); `
+              + 'supply milestone_ops.replace with the full corrected set to repair it');
+          }
+          milestones = {};
+        } else throw e;
+      }
+      if (ops.replace) milestones = parseMilestones(ops.replace);
+
+      for (const name of (Array.isArray(ops.clear) ? ops.clear : [])) {
+        if (!MILESTONES.includes(name)) throw new Error('unknown milestone: ' + name);
+        delete milestones[name];
+      }
+      for (const [name, occ] of Object.entries(ops.set || {})) {
+        if (!MILESTONES.includes(name)) throw new Error('unknown milestone: ' + name);
+        const at = String((occ && occ.at) || '').trim();
+        if (!at || tsToEpoch(at) === null) {
+          throw new Error(`milestone ${name} requires a parseable "at" timestamp`);
+        }
+        milestones[name] = {
+          at,
+          seq: Number.isFinite(Number(occ.seq)) ? Number(occ.seq) : null,
+          message_id: String(occ.message_id || ''),
+        };
+      }
+
+      // Write the facts AND the status they project, together, so the two can never disagree.
+      after.milestones = JSON.stringify(milestones);
+      after.status = projectStatus(milestones);
     }
 
     const changed = ROW_FIELDS.filter((f) => String(before[f] || '') !== String(after[f] || ''));

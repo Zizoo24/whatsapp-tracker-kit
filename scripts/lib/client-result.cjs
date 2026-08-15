@@ -24,6 +24,7 @@ const {
   OBSERVATION_MILESTONE,
   RECORD_FIELDS,
   TERMINAL_STATUS,
+  compareOccurrence,
   mergeMilestones,
   projectStatus,
 } = require('./status-model.cjs');
@@ -69,8 +70,10 @@ function validateObservations(record, newMessages) {
     if (!ids.length) throw new Error(`observation ${type} requires evidence_msg_ids`);
 
     const seen = [];
-    let at = '';
-    let seq = -1;
+    // The occurrence is the LATEST cited message, ordered by (at, seq). The model never
+    // supplies a timestamp — deterministic code resolves it from the message it cited, so a
+    // hallucinated time cannot enter the durable record.
+    let occurrence = null;
     for (const value of ids) {
       const id = String(value || '');
       // THE EVIDENCE GATE. An id that is not new means the model is justifying a write with
@@ -81,25 +84,20 @@ function validateObservations(record, newMessages) {
       }
       if (!seen.includes(id)) seen.push(id);
       if (!allEvidence.includes(id)) allEvidence.push(id);
-      // The milestone timestamp is the LATEST message proving it. Prep supplies the FULL
-      // timestamp and an ingestion `seq`; minute-truncated timestamps cannot order a payment
-      // confirmation against a file sent in the same minute, which is a routine occurrence.
-      const messageSeq = Number(message.seq);
-      if (Number.isFinite(messageSeq) ? messageSeq > seq : String(message.ts || '') > at) {
-        at = String(message.ts || '');
-        if (Number.isFinite(messageSeq)) seq = messageSeq;
-      }
+      const candidate = {
+        at: String(message.ts || ''),
+        seq: Number.isFinite(Number(message.seq)) ? Number(message.seq) : null,
+        message_id: id,
+      };
+      if (!candidate.at) throw new Error(`evidence message ${id} carries no timestamp`);
+      if (!occurrence || compareOccurrence(candidate, occurrence) > 0) occurrence = candidate;
     }
-    if (!at) throw new Error(`observation ${type} evidence carries no timestamp`);
-    observations.push({ type, at, seq: seq >= 0 ? seq : null, evidence_msg_ids: seen });
+    observations.push({ type, ...occurrence, evidence_msg_ids: seen });
   }
 
-  // Apply in true ingestion order. `seq` (the mirror's rowid) is exact; the timestamp is a
-  // fallback for hand-built fixtures.
-  observations.sort((a, b) => {
-    if (a.seq != null && b.seq != null) return a.seq - b.seq;
-    return a.at < b.at ? -1 : a.at > b.at ? 1 : 0;
-  });
+  // Apply in true ingestion order: timestamp, then `seq` as the deterministic tiebreak. Two
+  // messages routinely share a timestamp, and their order decides paid-versus-delivered.
+  observations.sort(compareOccurrence);
 
   return { observations, evidenceMsgIds: allEvidence };
 }

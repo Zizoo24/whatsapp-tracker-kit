@@ -33,12 +33,41 @@ test('GUARDS #25: status is projected from durable milestones, in exactly one pl
   const model = read('scripts/lib/status-model.cjs');
   assert.ok(model.includes('function projectStatus'), 'the projection must be a named pure function');
   // The unpaid rule is the clause the memoryless reducer lost. Pin it.
-  assert.ok(/if \(!m\.paid_at\) return 'confirmed_unpaid'/.test(model),
+  assert.ok(/if \(!m\.paid\) return 'confirmed_unpaid'/.test(model),
     'delivery must never complete an unpaid record');
   // Deriving status anywhere else is how two normalizers drift apart (GUARDS #21).
-  const validator = read('scripts/lib/client-result.cjs');
-  assert.ok(!/records\.push\([\s\S]{0,300}status:\s*derived/.test(validator),
+  assert.ok(!/records\.push\([\s\S]{0,300}status:\s*derived/.test(read('scripts/lib/client-result.cjs')),
     'validation must not compute an authoritative status; the writer owns it');
+});
+
+test('GUARDS #29: unreadable authoritative state fails closed everywhere it is read', () => {
+  const model = read('scripts/lib/status-model.cjs');
+  assert.ok(model.includes('class MilestoneStateError'), 'malformed truth needs its own error type');
+  assert.ok(!/catch\s*{\s*return \{\};/.test(model),
+    'parsing must not degrade malformed non-blank state to "no history"');
+  assert.ok(read('scripts/tracker-apply.cjs').includes('MilestoneStateError'),
+    'the writer must abort rather than write over unreadable state');
+});
+
+test('GUARDS #30: the writer emits exactly one row per record_id per tick', () => {
+  const apply = read('scripts/tracker-apply.cjs');
+  assert.ok(/byRecord\s*=\s*new Map\(\)/.test(apply), 'updates must be aggregated by record_id');
+  assert.ok(/agg\.observations\.push\(\.\.\.d\.observations\)/.test(apply),
+    'every lane\'s observations must be unioned, not written as separate rows');
+});
+
+test('GUARDS #31: a pre-milestone row blocks the automated lane instead of being rewritten', () => {
+  assert.ok(/predates the milestone model/.test(read('scripts/tracker-apply.cjs')),
+    'blank milestones beside a real status must not be read as "no history"');
+});
+
+test('GUARDS #32: operators correct facts, not the projection', () => {
+  const admin = read('scripts/tracker-admin.cjs');
+  assert.ok(/status is a projection of milestones and cannot be set directly/.test(admin),
+    'a status-only correction vanishes on the next observation');
+  assert.ok(admin.includes('milestone_ops'), 'the tool must expose the real correction target');
+  assert.ok(/'counterparty', 'milestones'\]/.test(admin),
+    'milestones must be covered by snapshot, concurrency, backup and readback');
 });
 
 test('the admin tool takes the SAME writer lock, rather than only advising it', () => {

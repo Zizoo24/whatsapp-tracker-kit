@@ -439,6 +439,92 @@ that no automatic rollback was performed and points at the backup.
 
 ---
 
+---
+
+## #28 — Storage threw away the ordering validation had just established
+
+**Found by external audit of v1.2.0.** Validation ordered observations by the mirror's
+ingestion `seq` — correctly, because two messages routinely share a timestamp. But milestones
+were stored as **bare timestamps**, so `seq` was discarded at the moment of persistence.
+
+The projection then compared `revision > delivered` on timestamps alone. A revision requested
+in the **same second** as the delivery compared equal, the clause was false, and the record
+projected as **done** — the customer's correction request silently vanished.
+
+**Guard:** a milestone is an **occurrence** `{ at, seq, message_id }`, and `compareOccurrence`
+orders by timestamp then `seq`. Provenance comes along for free: every stored fact names the
+message that proved it.
+
+**Meta-lesson:** an invariant established upstream must be *representable* downstream.
+Precision that storage cannot express is precision you do not have.
+
+---
+
+## #29 — Malformed authoritative state degraded to "no history"
+
+**Found by external audit of v1.2.0.** `parseMilestones` caught a JSON error and returned
+`{}`. Since milestones are *declared machine truth*, a corrupted cell therefore read as "this
+record has no history" — and the next write would confidently rebuild it from nothing,
+destroying the real state.
+
+This is the same fail-open class already removed from the LID and store reads (#24),
+reintroduced on the field that had just been made authoritative.
+
+**Guard:** `MilestoneStateError`. Blank is a legitimately new record; **non-blank but
+unreadable is a hard stop** — abort the write, keep the cursor, alert. Repair is possible only
+through an explicit `milestone_ops.replace`, so nobody accidentally builds on unreadable state.
+
+---
+
+## #30 — Two lanes wrote two rows for one record in one tick
+
+**Found by external audit of v1.2.0.** The customer pass and the counterparty pass could each
+produce an update for the **same `record_id`** in a single tick. Both were merged against the
+same pre-run snapshot and written as **two separate rows**. The store merges by key and takes
+the later non-empty cell, so the second `milestones` value **overwrote** the first — one
+lane's facts destroyed by the other.
+
+The unit tests verified that the counterparty update was appended, and never ran the appended
+result through the writer. The bug lived precisely in the gap between them.
+
+**Guard:** **exactly one outgoing write per `record_id` per tick.** `tracker-apply` aggregates
+every lane's contribution by id, unions the observations, orders once, merges once, projects
+once. Plus an integration test spanning customer → counterparty → aggregation → writer.
+
+---
+
+## #31 — A pre-milestone row would have been silently rewritten
+
+**Found by external audit of v1.2.0.** Rows written before milestones existed carry a real
+status and an empty milestones cell. Projecting from empty rewrites their history: a completed
+order whose customer requests a revision projects to `confirmed_unpaid`, because no `paid`
+fact exists to find.
+
+**Guard:** a **migration gate**. A row with a non-empty status and blank milestones blocks the
+automated lane, which keeps the cursor and reports the record. Blank never means "there was no
+history". Backfill procedure: [MIGRATION.md](MIGRATION.md).
+
+---
+
+## #32 — The correction tool edited the projection instead of the truth
+
+**Found by external audit of v1.2.0.** Once milestones became authoritative, `tracker-admin`
+was still correcting `status` — and did not carry `milestones` in its snapshot, concurrency
+check, backup or readback.
+
+Two failures follow. A status correction **looks** successful and then vanishes: the next
+observation re-projects from unchanged milestones. And a **false milestone cannot be removed
+at all** — if a wrong `paid` fact caused the bad status, no correction could reach it.
+
+**Guard:** operators correct **facts**. `milestone_ops` (`set` / `clear` / `replace`) is the
+correction path; setting `status` directly is refused with an explanation. `milestones` is now
+covered by the snapshot, the optimistic concurrency check, the backup and the readback.
+
+**Meta-lesson:** declaring a representation authoritative is a claim every write path must
+honour. A correction path that edits a derived view is a correction that does not exist.
+
+---
+
 ## The meta-lessons
 
 1. **Never advance a cursor over a message you did not show the model.** Every
@@ -470,3 +556,10 @@ that no automatic rollback was performed and points at the backup.
     list everything it was accidentally protecting.
 13. **Never claim a recovery action you did not perform.** #27's "rows restored" message
     would have sent an operator away from a store in an unknown state.
+14. **Whatever you declare authoritative, every path must respect.** #29, #30 and #32 are one
+    failure wearing three hats: malformed truth degrading to empty, two writers producing
+    competing truth, and a correction path editing a projection instead of the truth.
+15. **Precision must survive storage.** #28 — ordering established in validation and thrown
+    away at persistence is ordering you never had.
+16. **Test the gap between components, not just the components.** #30 lived exactly where two
+    green unit tests met.

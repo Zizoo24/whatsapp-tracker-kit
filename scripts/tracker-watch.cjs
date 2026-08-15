@@ -279,6 +279,10 @@ const extractCounterparty = (file) => extractFile(file, COUNTERPARTY_RULES,
 
       const eligible = {};
       for (const o of input.in_flight) eligible[o.record_id] = String(o.status || '').trim();
+      // Resolve cited ids against the messages prep marked new. The model supplies ids ONLY;
+      // deterministic code supplies the timestamp and ingestion seq, so a hallucinated time
+      // can never enter the durable record.
+      const newById = new Map((input.new_messages || []).map((m) => [String(m.id), m]));
 
       // Union the model's updates with the deterministic heuristic (disabled by default),
       // then filter BOTH against the eligible set — a hallucinated id cannot survive this.
@@ -291,10 +295,23 @@ const extractCounterparty = (file) => extractFile(file, COUNTERPARTY_RULES,
         // Handing an eligible record to a counterparty means WORK HAS STARTED. Emitting that
         // as a milestone observation — rather than a status — keeps every lane going through
         // the same projection, so a handoff can never overwrite a further stage.
+        const citedIds = Array.isArray(u.evidence_msg_ids) ? u.evidence_msg_ids.map(String)
+          : (u.evidence_msg_id ? [String(u.evidence_msg_id)] : []);
+        const cited = citedIds.map((id) => newById.get(id)).filter(Boolean);
+        if (!cited.length) {
+          // Without resolvable evidence the milestone cannot be ordered against anything, so
+          // the handoff would be silently dropped downstream. Say so here instead.
+          log('  counterparty:' + v.counterparty + ' skipped ' + u.record_id
+            + ' (no resolvable evidence_msg_ids)');
+          continue;
+        }
+        const latest = cited.reduce((a, b) => (Number(b.seq) > Number(a.seq) ? b : a));
         const merged = mergeCounterpartyUpdate(results, u.record_id, v.counterparty, {
           type: 'work_started',
-          at: u.at || u.ts || '',
-          evidence_msg_ids: u.evidence_msg_id ? [u.evidence_msg_id] : [],
+          at: String(latest.ts || ''),
+          seq: Number.isFinite(Number(latest.seq)) ? Number(latest.seq) : null,
+          message_id: String(latest.id),
+          evidence_msg_ids: citedIds,
         });
         if (merged.added) {
           log('  counterparty:' + v.counterparty + ' -> ' + u.record_id + ' [work_started] ('

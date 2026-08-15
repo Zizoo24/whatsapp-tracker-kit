@@ -4,20 +4,25 @@
 //
 // THE SINGLE PLACE STATUS IS DERIVED:
 //
-//   stored milestones  +  this run's observations  ->  merged milestones  ->  projected status
+//   stored milestones  +  ALL of this tick's observations for that record
+//     -> merged milestones  ->  projected status  ->  ONE row
 //
-// Milestones are durable facts about the past and only ever accumulate, so a stale re-read
-// cannot walk a record backwards — the monotonic guard is implicit in the data model rather
-// than bolted on. It also means a record delivered while unpaid stays `confirmed_unpaid` and
-// flips to `done` the moment payment lands, even though the delivery evidence is by then old
-// context. See the header of scripts/lib/status-model.cjs.
+// EXACTLY ONE OUTGOING WRITE PER record_id PER TICK (GUARDS #30). The customer pass and the
+// counterparty pass can both produce an update for the same record in one tick. Writing them
+// as two rows meant the second `milestones` value overwrote the first — the store merges by
+// key and takes the later non-empty cell — so one lane's facts were silently destroyed.
+// Observations are unioned here, merged once, and projected once.
+//
+// Milestones only accumulate, so a stale re-read cannot walk a record backwards: the
+// monotonic guard is implicit in the data model rather than bolted on.
 //
 // Usage: node scripts/tracker-apply.cjs [--keep-cursor]
 
 const fs = require('fs');
 const path = require('path');
 const {
-  VALID_STATUS, canAutomatedTransition, mergeMilestones, projectStatus,
+  MilestoneStateError, VALID_STATUS, canAutomatedTransition, compareOccurrence,
+  mergeMilestones, projectStatus,
 } = require('./lib/status-model.cjs');
 const { advanceCursorState } = require('./lib/message-cursor.cjs');
 
@@ -36,7 +41,9 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
   const { appendRows, fetchRows } = await import('file://' + path.join(ROOT, 'src', 'sheet.js').replace(/\\/g, '/'));
   const cfg = loadConfig();
 
-  const pending = [];
+  // ---- Aggregate by record_id BEFORE touching the store -------------------------------
+  // Every lane's contribution to one record is collapsed into a single logical update.
+  const byRecord = new Map();
   for (const entry of results) {
     const phone = canon(entry.phone);
     for (const d of entry.records || []) {
@@ -46,22 +53,33 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
         console.error('refusing a record without a validated record_id');
         process.exit(1);
       }
-      pending.push({ phone, record: d });
+      const id = String(d.record_id);
+      const agg = byRecord.get(id) || {
+        record_id: id, phone, fields: {}, observations: [], counterparty: '', directStatus: '',
+      };
+      if (phone) agg.phone = agg.phone || phone;
+      for (const f of ['start_date', 'client_name', 'doc_type', 'language_pair', 'price', 'delivery_time', 'summary']) {
+        // Later non-empty values win; a lane that says nothing about a field never clears it.
+        if (!__isBlank(d[f])) agg.fields[f] = d[f];
+      }
+      if (d.counterparty) agg.counterparty = d.counterparty;
+      if (Array.isArray(d.observations)) agg.observations.push(...d.observations);
+      if (d.status) agg.directStatus = d.status;
+      byRecord.set(id, agg);
     }
   }
 
-  if (!pending.length) {
+  function __isBlank(v) { return v === null || v === undefined || String(v).trim() === ''; }
+
+  if (!byRecord.size) {
     // The chats WERE evaluated; they simply held nothing committed. That is a normal,
     // correct outcome — not a failure — so the cursor should still advance.
     console.log('tracker-apply: no committed records to write this run');
   }
 
-  // ---- Read authoritative current state: FAIL CLOSED (docs/GUARDS.md #24) --------------
-  // The projection needs each record's STORED MILESTONES. v1 caught a failed pre-read and
-  // wrote anyway "without the guard" — inverting the fail-closed rule at the one place it
-  // protects hard-won state. Without current state we do not write and do not advance.
+  // ---- Read authoritative current state: FAIL CLOSED (GUARDS #24) ---------------------
   const currentByRecord = new Map();
-  if (pending.length) {
+  if (byRecord.size) {
     try {
       for (const r of await fetchRows(cfg, 'Records')) {
         if (r.record_id) currentByRecord.set(String(r.record_id), r);
@@ -75,56 +93,82 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
   }
 
   const rows = [];
-  for (const { phone, record } of pending) {
-    const current = currentByRecord.get(String(record.record_id));
+  let blocked = 0;
+  for (const agg of byRecord.values()) {
+    const current = currentByRecord.get(agg.record_id);
     const currentStatus = String(current?.status || '').trim();
-    const observations = Array.isArray(record.observations) ? record.observations : [];
+    const storedMilestones = current?.milestones;
 
-    const row = {
-      record_id: record.record_id,
-      source_date: record.start_date || '',
-      client_name: record.client_name || '',
-      phone,
-      doc_type: record.doc_type || '',
-      language_pair: record.language_pair || '',
-      price: record.price || '',
-      delivery_time: record.delivery_time || '',
-      summary: record.summary || '',
-    };
+    // ---- MIGRATION GATE (GUARDS #31) --------------------------------------------------
+    // A row carrying a lifecycle status but NO milestones predates this model. Its history
+    // is real but unrecorded, and projecting from an empty milestone set would silently
+    // rewrite it — e.g. a completed order whose customer requests a revision would project
+    // to `confirmed_unpaid`, because no `paid` fact exists to find. Blank must never be read
+    // as "there was no history".
+    if (currentStatus && __isBlank(storedMilestones)) {
+      console.error(`ABORT: ${agg.record_id} has status "${currentStatus}" but no milestones — `
+        + 'this row predates the milestone model. Run the backfill (docs/MIGRATION.md) before '
+        + 'the automated lane may write to it.');
+      blocked++;
+      continue;
+    }
 
-    if (observations.length) {
-      const merged = mergeMilestones(current?.milestones, observations);
+    const row = { record_id: agg.record_id, phone: agg.phone };
+    if (!__isBlank(agg.fields.start_date)) row.source_date = agg.fields.start_date;
+    for (const f of ['client_name', 'doc_type', 'language_pair', 'price', 'delivery_time', 'summary']) {
+      if (!__isBlank(agg.fields[f])) row[f] = agg.fields[f];
+    }
+    if (agg.counterparty) row.counterparty = agg.counterparty;
+
+    if (agg.observations.length) {
+      // Union of every lane's observations for this record, in true ingestion order.
+      const ordered = [...agg.observations].sort(compareOccurrence);
+      let merged;
+      try {
+        merged = mergeMilestones(storedMilestones, ordered);
+      } catch (e) {
+        if (e instanceof MilestoneStateError) {
+          // Declared machine truth that cannot be read must never degrade to "no history".
+          console.error(`ABORT: ${agg.record_id} has unreadable milestone state (${e.message}). `
+            + 'Refusing to write; inspect the row and repair it with tracker-admin.');
+          blocked++;
+          continue;
+        }
+        throw e;
+      }
       for (const r of merged.refused) {
-        console.log(`guard: ${record.record_id} refused ${r.observation} (${r.reason})`);
+        console.log(`guard: ${agg.record_id} refused ${r.observation} (${r.reason})`);
       }
       const status = projectStatus(merged.milestones);
       // The milestones column is the machine-readable truth; `status` is the human view
       // projected from it. Both are written together so they can never disagree.
       row.milestones = JSON.stringify(merged.milestones);
       row.status = status;
-      if (merged.milestones.paid_at) row.paid_at = merged.milestones.paid_at;
+      if (merged.milestones.paid) row.paid_at = merged.milestones.paid.at;
       if (status !== currentStatus) {
-        console.log(`  ${record.record_id}: ${currentStatus || '(new)'} -> ${status}`);
+        console.log(`  ${agg.record_id}: ${currentStatus || '(new)'} -> ${status}`);
       }
-    } else {
-      // A lane that supplies a status directly (the counterparty pass) must clear the same
-      // gate. result-merge only sees this run's results; the live store may have moved on
-      // since prep read it, so the authoritative check happens here too.
-      const incoming = String(record.status || '').trim();
-      if (VALID_STATUS.has(incoming)) {
-        const verdict = canAutomatedTransition(currentStatus || null, incoming);
-        if (verdict.allowed) row.status = incoming;
-        else console.log(`guard: ${record.record_id} kept "${currentStatus}" (${verdict.reason})`);
-      }
+    } else if (agg.directStatus) {
+      // A lane supplying a status with no observations must still clear the explicit gate.
+      const verdict = canAutomatedTransition(currentStatus || null, agg.directStatus);
+      if (VALID_STATUS.has(agg.directStatus) && verdict.allowed) row.status = agg.directStatus;
+      else console.log(`guard: ${agg.record_id} kept "${currentStatus}" (${verdict.reason})`);
     }
 
-    if (record.counterparty) row.counterparty = record.counterparty;
     rows.push(row);
   }
 
   if (rows.length) {
     const res = await appendRows(rows, cfg, 'Records'); // upsert by record_id
     console.log('tracker-apply:', JSON.stringify(res), '| rows:', rows.length);
+  }
+
+  // A blocked record means real evidence was NOT recorded. Keep the cursor so it is retried
+  // once the operator resolves the cause, rather than advancing past it.
+  if (blocked) {
+    console.error(`cursor kept: ${blocked} record(s) blocked and must be resolved`);
+    process.exitCode = 1;
+    return;
   }
 
   // A PARTIAL run still applies its successful rows but KEEPS the cursor, so deferred chats
