@@ -45,17 +45,30 @@ WhatsApp Business App + Cloud API (Coexistence)
 bridge supervisor and restart budget, LID mapping, and the CGO/Go build. That is a
 substantial reduction in moving parts and failure modes.
 
-**Verify before committing** — these are the known constraints, and they change:
+> **NOT YET IMPLEMENTED IN THIS KIT.** This section describes the target adapter, not a
+> switch you can flip. `tracker-watch.cjs` currently requires `WHATSAPP_DB_PATH` and
+> `WHATSAPP_BRIDGE_EXE` and supervises the bridge; `tracker-prep.cjs` reads the bridge's
+> `messages.db` and its `whatsapp.db` LID map. Choosing Coexistence today means **writing an
+> ingest adapter** that lands webhooks into the same canonical mirror schema (see "What stays
+> identical" below). For a first deployment, the bridge is the implemented, battle-tested
+> path.
 
-- **Device coverage.** Messages sent from some companion devices may not generate an echo
-  webhook. If your team works from an unsupported desktop client, you will silently lose
-  business-side evidence — the worst possible failure for this system.
-- **Groups.** Group messaging support is limited or unavailable for Coexistence users at the
-  time of writing. **If your workflow depends on group chats, this option is out.**
-- **Onboarding history.** Echoes begin at onboarding; expect little or no backfill.
+**Verify before committing** — these constraints are real and they change:
+
+- **Device coverage.** Messages sent from some companion clients may not produce an echo
+  webhook (WhatsApp for Windows is listed as unsupported in current provider documentation).
+  If your team works from an unsupported desktop client you will **silently lose
+  business-side evidence** — the worst possible failure for this system.
+- **Groups.** Current provider documentation states groups are not available to Coexistence
+  users. **If order coordination happens in group chats, this option is out.** For a
+  translation business with vendor groups, this is usually the deciding constraint.
+- **History.** Providers describe an optional history sync/webhook carrying past messages
+  once history sharing is approved at onboarding. So do **not** assume zero backfill — but do
+  not assume completeness either. **Verify actual coverage during onboarding**, before
+  trusting the tracker with pre-onboarding orders.
 
 Check your provider's current documentation rather than trusting this page — this area moves
-quickly.
+quickly, and the claims above were not verified against a live account.
 
 ---
 
@@ -77,12 +90,12 @@ and a C toolchain unless you migrate to pure-Go SQLite.
 
 | Your situation | Ingress |
 |---|---|
-| Team works in the Business app on supported devices, no group workflow | **A — Coexistence** |
-| Orders are coordinated in WhatsApp **groups** | **B — bridge** |
+| **First deployment, any situation** | **B — bridge** (A needs an adapter first) |
+| Orders coordinated in WhatsApp **groups** (common for vendor work) | **B — bridge** |
 | Unsupported companion/desktop client in daily use | **B — bridge** |
-| Need conversation history from before onboarding | **B — bridge** |
 | No BSP account and no appetite for one | **B — bridge** |
-| Unsure | **Test A on one number for a week**, confirm business-side echoes actually arrive for every device your team uses, then decide |
+| Team works in the Business app on supported devices, no group workflow, and you are willing to build the adapter | **A — Coexistence** |
+| Unsure | **Ship on the bridge**, then trial A on one number: confirm business-side echoes arrive for every device your team uses, and check what history sync actually delivers |
 
 ---
 

@@ -48,15 +48,20 @@ var SHEETS = {
   Records: {
     key: 'record_id',
     sortCol: 'source_date',
+    // `milestones` is a JSON object of durable timestamps (committed_at, paid_at,
+    // final_delivered_at, ...). It is the MACHINE-READABLE TRUTH; `status` is the human view
+    // projected from it. Keeping milestones means the tracker never forgets that a job was
+    // delivered while unpaid — it flips to done the moment payment lands, even though the
+    // delivery evidence is by then old context.
     headers: [
       'logged_at', 'updated_at', 'source_date', 'client_name', 'phone', 'doc_type',
       'language_pair', 'price', 'delivery_time', 'status', 'summary', 'record_id',
-      'paid_amount', 'paid_at', 'charge_id', 'counterparty',
+      'paid_amount', 'paid_at', 'charge_id', 'counterparty', 'milestones',
     ],
     merge: [
       'source_date', 'client_name', 'phone', 'doc_type', 'language_pair', 'price',
       'delivery_time', 'status', 'summary', 'paid_amount', 'paid_at', 'charge_id',
-      'counterparty',
+      'counterparty', 'milestones',
     ],
   },
   Payments: {

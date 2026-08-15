@@ -11,19 +11,20 @@ authority for corrections, ambiguity, and deep audits — the automated lane is 
 
 ---
 
-## The concurrency rule — read this first
+## Concurrency
 
-The automated extraction lane and this lane **do not share a lock**. Before any write:
+`tracker-admin apply` acquires the **same** `.tracker-lock` the automated writer uses, so a
+scheduled tick cannot run concurrently — if the lane is mid-tick, the apply refuses and tells
+you to retry. Safety here is enforced, not advised.
+
+For a long investigation session it is still tidier to stop the scheduled lane, so rows do
+not shift under your analysis between snapshot and apply:
 
 ```powershell
 Disable-ScheduledTask tracker-watch      # or: systemctl --user stop tracker-watch.timer
-# wait for .tracker-lock to disappear
-# ... apply ...
+# ... investigate, propose, apply ...
 Enable-ScheduledTask tracker-watch
 ```
-
-Two writers on one store is a split-brain that costs a day of reconciliation. Never skip
-this because the change "is small".
 
 ---
 

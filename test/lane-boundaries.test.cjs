@@ -20,12 +20,33 @@ test('GUARDS #18: the keepalive is TRANSPORT ONLY — no webhook action but hear
   }
 });
 
-test('GUARDS #13: the transition guard lives at the writer, never in the store API', () => {
-  assert.ok(read('scripts/tracker-apply.cjs').includes('reduceObservations'),
-    'the writer must derive status through the guarded reducer');
+test('GUARDS #13: status is derived at the writer, never in the store API', () => {
+  const apply = read('scripts/tracker-apply.cjs');
+  assert.ok(apply.includes('mergeMilestones') && apply.includes('projectStatus'),
+    'the writer must derive status by merging milestones and projecting');
   const store = read('apps-script/Code.gs');
-  assert.ok(!store.includes('STATUS_RANK') && !store.includes('canAutomatedTransition'),
+  assert.ok(!store.includes('STATUS_RANK') && !store.includes('projectStatus'),
     'the store API must stay a dumb upsert — it is also the correction path');
+});
+
+test('GUARDS #25: status is projected from durable milestones, in exactly one place', () => {
+  const model = read('scripts/lib/status-model.cjs');
+  assert.ok(model.includes('function projectStatus'), 'the projection must be a named pure function');
+  // The unpaid rule is the clause the memoryless reducer lost. Pin it.
+  assert.ok(/if \(!m\.paid_at\) return 'confirmed_unpaid'/.test(model),
+    'delivery must never complete an unpaid record');
+  // Deriving status anywhere else is how two normalizers drift apart (GUARDS #21).
+  const validator = read('scripts/lib/client-result.cjs');
+  assert.ok(!/records\.push\([\s\S]{0,300}status:\s*derived/.test(validator),
+    'validation must not compute an authoritative status; the writer owns it');
+});
+
+test('the admin tool takes the SAME writer lock, rather than only advising it', () => {
+  const admin = read('scripts/tracker-admin.cjs');
+  assert.ok(admin.includes('acquireRunLock') && admin.includes(".tracker-lock'"),
+    'a documented "stop the scheduler first" is not a guarantee');
+  assert.ok(!/rows restored from/.test(admin),
+    'the tool must not claim a rollback it does not perform');
 });
 
 test('GUARDS #23: new evidence is never truncated; only context is', () => {

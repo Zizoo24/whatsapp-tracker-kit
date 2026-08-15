@@ -38,6 +38,12 @@ Emit EVERY observation the new messages justify, each with its own evidence. If 
 committed, paid and delivered all within these new messages, emit all three — the system
 walks the whole lifecycle in one pass.
 
+Observations are DURABLE FACTS. The system remembers each one permanently, so you never need
+to re-report something you already reported, and you must never withhold an observation
+because it "doesn't fit" the order's current stage. If we delivered work before the customer
+paid, report `final_delivered` anyway — the system keeps the order in the chase-payment stage
+and completes it automatically when payment later arrives.
+
 IDENTITY CONTRACT (LOAD-BEARING):
 - Report ONLY orders that new_messages say something about. Do not re-report unchanged orders.
 - NEW ORDER: kind="new", record_id=null, and order_anchor_id is the earliest new message

@@ -2,21 +2,23 @@
 'use strict';
 // tracker-apply.cjs — DETERMINISTIC WRITE. No model call happens here.
 //
-// Reads .tracker-work/results.json, derives each record's status from its OBSERVATIONS
-// against the live store, upserts by record_id, and — only on full success — advances the
-// rowid cursor.
+// THE SINGLE PLACE STATUS IS DERIVED:
 //
-// results.json shape (produced by tracker-watch after validation):
-//   [ { "phone": "...", "records": [
-//       { "record_id": "<validated immutable id>", "start_date": "YYYY-MM-DD or '' for update",
-//         "observations": [{ "type": "payment_received", "evidence_msg_ids": ["m1"] }],
-//         "client_name": "", "doc_type": "", ... } ] } ]
+//   stored milestones  +  this run's observations  ->  merged milestones  ->  projected status
+//
+// Milestones are durable facts about the past and only ever accumulate, so a stale re-read
+// cannot walk a record backwards — the monotonic guard is implicit in the data model rather
+// than bolted on. It also means a record delivered while unpaid stays `confirmed_unpaid` and
+// flips to `done` the moment payment lands, even though the delivery evidence is by then old
+// context. See the header of scripts/lib/status-model.cjs.
 //
 // Usage: node scripts/tracker-apply.cjs [--keep-cursor]
 
 const fs = require('fs');
 const path = require('path');
-const { VALID_STATUS, canAutomatedTransition, reduceObservations } = require('./lib/status-model.cjs');
+const {
+  VALID_STATUS, canAutomatedTransition, mergeMilestones, projectStatus,
+} = require('./lib/status-model.cjs');
 const { advanceCursorState } = require('./lib/message-cursor.cjs');
 
 const ROOT = path.join(__dirname, '..');
@@ -39,7 +41,7 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
     const phone = canon(entry.phone);
     for (const d of entry.records || []) {
       // A record without a validated id is an upstream bug, not something to paper over:
-      // writing it creates an unaddressable row that nothing can ever update.
+      // writing it creates an unaddressable row nothing can ever update.
       if (!d.record_id) {
         console.error('refusing a record without a validated record_id');
         process.exit(1);
@@ -54,68 +56,29 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
     console.log('tracker-apply: no committed records to write this run');
   }
 
-  // ---- Read the authoritative current state: FAIL CLOSED (docs/GUARDS.md #24) ----------
-  // The reducer needs each record's CURRENT status to decide which observations may apply.
-  // v1 caught a failed pre-read and wrote anyway "without the guard" — precisely inverting
-  // the fail-closed rule at the one place it protects hard-won state. If we cannot see the
-  // current state, we do not write and we do not advance the cursor.
-  let currentByRecord = new Map();
+  // ---- Read authoritative current state: FAIL CLOSED (docs/GUARDS.md #24) --------------
+  // The projection needs each record's STORED MILESTONES. v1 caught a failed pre-read and
+  // wrote anyway "without the guard" — inverting the fail-closed rule at the one place it
+  // protects hard-won state. Without current state we do not write and do not advance.
+  const currentByRecord = new Map();
   if (pending.length) {
     try {
-      const currentRows = await fetchRows(cfg, 'Records');
-      for (const r of currentRows) if (r.record_id) currentByRecord.set(String(r.record_id), r);
+      for (const r of await fetchRows(cfg, 'Records')) {
+        if (r.record_id) currentByRecord.set(String(r.record_id), r);
+      }
     } catch (e) {
       console.error('ABORT: could not read current store state (' + e.message + '). '
-        + 'Refusing to write without it — a blind write can silently walk a completed record '
-        + 'backwards. The cursor is kept; the next tick retries.');
+        + 'Refusing to write without it — a blind write can silently discard milestones. '
+        + 'The cursor is kept; the next tick retries.');
       process.exit(1);
     }
   }
 
-  // ---- Derive status from observations ------------------------------------------------
-  // THE GUARD LIVES HERE, AT THE SOLE AUTOMATED WRITER — never in the store API, which is
-  // also the correction path and must stay a dumb, honest upsert (GUARDS #13).
-  //
-  // canAutomatedTransition (inside the reducer) replaces v1's raw rank comparison, which
-  // classified the legitimate `done -> revision` move as a downgrade and silently discarded
-  // it while validation had explicitly allowed it (GUARDS #22).
   const rows = [];
   for (const { phone, record } of pending) {
     const current = currentByRecord.get(String(record.record_id));
     const currentStatus = String(current?.status || '').trim();
     const observations = Array.isArray(record.observations) ? record.observations : [];
-
-    let status;
-    if (observations.length) {
-      const derived = reduceObservations(currentStatus || null, observations);
-      status = derived.status;
-      for (const r of derived.refused) {
-        console.log(`guard: ${record.record_id} refused ${r.observation} (${r.reason})`);
-      }
-      if (!status || status === currentStatus) {
-        // Every observation was refused, or none moved the record. Other fields may still
-        // legitimately refresh, so fall through with no status key rather than dropping the
-        // row — the non-empty merge then leaves the existing stage intact.
-        status = null;
-      }
-    } else {
-      // A pre-derived status (the counterparty pass supplies one directly, with no
-      // observations) must clear the SAME gate. The in-run precedence check in
-      // result-merge.cjs only sees this run's results; the live store may have moved on
-      // since prep read it, so the authoritative check has to happen here too.
-      const incoming = String(record.status || '').trim();
-      if (!VALID_STATUS.has(incoming)) {
-        status = null;
-      } else {
-        const verdict = canAutomatedTransition(currentStatus || null, incoming);
-        if (verdict.allowed) {
-          status = incoming;
-        } else {
-          status = null;
-          console.log(`guard: ${record.record_id} kept "${currentStatus}" (${verdict.reason})`);
-        }
-      }
-    }
 
     const row = {
       record_id: record.record_id,
@@ -128,7 +91,33 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
       delivery_time: record.delivery_time || '',
       summary: record.summary || '',
     };
-    if (status) row.status = status;
+
+    if (observations.length) {
+      const merged = mergeMilestones(current?.milestones, observations);
+      for (const r of merged.refused) {
+        console.log(`guard: ${record.record_id} refused ${r.observation} (${r.reason})`);
+      }
+      const status = projectStatus(merged.milestones);
+      // The milestones column is the machine-readable truth; `status` is the human view
+      // projected from it. Both are written together so they can never disagree.
+      row.milestones = JSON.stringify(merged.milestones);
+      row.status = status;
+      if (merged.milestones.paid_at) row.paid_at = merged.milestones.paid_at;
+      if (status !== currentStatus) {
+        console.log(`  ${record.record_id}: ${currentStatus || '(new)'} -> ${status}`);
+      }
+    } else {
+      // A lane that supplies a status directly (the counterparty pass) must clear the same
+      // gate. result-merge only sees this run's results; the live store may have moved on
+      // since prep read it, so the authoritative check happens here too.
+      const incoming = String(record.status || '').trim();
+      if (VALID_STATUS.has(incoming)) {
+        const verdict = canAutomatedTransition(currentStatus || null, incoming);
+        if (verdict.allowed) row.status = incoming;
+        else console.log(`guard: ${record.record_id} kept "${currentStatus}" (${verdict.reason})`);
+      }
+    }
+
     if (record.counterparty) row.counterparty = record.counterparty;
     rows.push(row);
   }
@@ -138,8 +127,8 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
     console.log('tracker-apply:', JSON.stringify(res), '| rows:', rows.length);
   }
 
-  // A PARTIAL run still applies its successful rows but KEEPS the cursor, so the deferred
-  // chats are retried losslessly next tick. Upsert-by-id makes the retry harmless.
+  // A PARTIAL run still applies its successful rows but KEEPS the cursor, so deferred chats
+  // are retried losslessly next tick. Upsert-by-id makes the retry harmless.
   if (keepCursor) {
     console.log('cursor kept (partial extraction)');
     return;

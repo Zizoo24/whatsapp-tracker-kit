@@ -44,9 +44,16 @@ const MAX_CONTEXT = Number(process.env.TRACKER_MAX_CONTEXT_MSGS || 150);
 const canon = (s) => String(s || '').replace(/\D/g, '');
 const fail = (msg) => { console.error('prep ABORT: ' + msg); process.exit(1); };
 
+// FULL timestamp plus the mirror's rowid as `seq`.
+//
+// v1.1 truncated to minute precision (`slice(0, 16)`) while validation ordered observations
+// by that timestamp. A payment confirmation and a file send routinely land in the SAME
+// minute, so their order — which decides paid-vs-delivered — was effectively arbitrary.
+// `seq` is exact ingestion order and is what validation sorts on.
 const toRow = (m, from, isNew) => ({
   id: m.id,
-  ts: String(m.timestamp).slice(0, 16),
+  ts: String(m.timestamp),
+  seq: Number(m.rowid),
   from,
   is_new: isNew,
   text: m.content || (m.media_type ? '[' + m.media_type + (m.filename ? ': ' + m.filename : '') + ']' : ''),
@@ -234,10 +241,13 @@ const toRow = (m, from, isNew) => ({
     if (!newMessages.length) continue;
     const trimmedContext = context.slice(-MAX_CONTEXT);
 
+    // `milestones` travels with each existing row so validation can tell whether new
+    // observations would actually change a terminal record.
     const existing_rows = (rowsByPhone[phone] || []).map((r) => ({
       record_id: r.record_id, source_date: String(r.source_date).slice(0, 10), doc_type: r.doc_type,
       price: r.price, status: r.status, paid_at: r.paid_at || '', client_name: r.client_name || '',
       language_pair: r.language_pair || '', delivery_time: r.delivery_time || '', summary: r.summary || '',
+      milestones: r.milestones || '',
     }));
     const file = path.join(WORKDIR, 'chat_' + phone + '.json');
     fs.writeFileSync(file, JSON.stringify({

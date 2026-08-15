@@ -1,11 +1,39 @@
-# Porting guide — adapting the kit to your domain
+# Porting guide — adapting the kit
 
 Split the kit into **core invariants** (do not change; they are the correctness of the
 system) and **business modules** (change, or delete entirely).
 
-> v1 of this guide claimed "only three seams; everything else ports unchanged." That was
+> v1.0 of this guide claimed "only three seams; everything else ports unchanged." That was
 > overconfident — `counterparty.cjs` is itself a deployment seam, and payments, groups and
 > attribution are all business-specific. The honest split is below.
+
+## Porting to ANOTHER TRANSLATION BUSINESS
+
+If the target business is also document/translation services, **most of the "domain" layer
+is an asset, not scaffolding to replace.** The prompts encode hard-won behaviour that is
+industry-wide, not company-specific: quotes and per-document jobs, language pairs, payment
+screenshots where the processor has no read API, the draft-versus-certified-final
+distinction, repeat orders in one long thread, and forwarding a document to a translator for
+a *price quote* versus a real handoff.
+
+Expect the deployment-specific surface to be small:
+
+```
+.env                  new WhatsApp number/session, store endpoint + secret,
+                      alert destination, timezone, model credentials
+counterparty config   their translators/vendors, and any vendor GROUP chats
+attribution map       their URLs -> short CTA refs
+payment module        their processor (or delete it)
+translation rules     ONLY where their workflow genuinely differs
+```
+
+Compare their operating process against `prompts/customer-rules.txt` **line by line** and
+change only real differences. Two blocks that do need checking: the UAE-specific
+**LANGUAGE DIRECTION** rules (delete or rewrite if they are not doing UAE certified work),
+and the **draft → stamped final** workflow, which not every provider follows.
+
+For a different industry entirely, treat the prompts as a worked example and rewrite them
+against `prompts/TEMPLATE-NOTES.md`.
 
 ---
 

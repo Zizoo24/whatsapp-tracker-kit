@@ -1,9 +1,9 @@
 {
   "name": "whatsapp-tracker-kit",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
-  "description": "Portable WhatsApp -> spreadsheet tracker: message stream -> rowid cursor -> one LLM judgment step -> idempotent upsert.",
+  "description": "Portable WhatsApp -> spreadsheet tracker for document/translation businesses: message stream -> ingestion cursor -> one LLM observation pass -> durable milestones -> projected lifecycle -> idempotent upsert.",
   "engines": { "node": ">=22.5" },
   "scripts": {
     "test": "node --test",

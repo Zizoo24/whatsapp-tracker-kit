@@ -25,14 +25,20 @@ money. Port the guards, not just the happy path. See [docs/GUARDS.md](docs/GUARD
 headless LLM call. Scripts = mechanism and compliance. LLM = reasoning. SQLite +
 cursor state = memory.
 
-**The model reports OBSERVATIONS. Code derives STATE.** The model never emits a status — it
-emits evidence-backed observations (`payment_received`, `draft_sent`, `final_delivered`) and
-`scripts/lib/status-model.cjs` maps them to a stage. That boundary deletes a class of failure
-prompt engineering could only discourage: a customer typing "Done" (meaning *they paid*)
-cannot reach the terminal stage, and a draft cannot complete a record, because neither
-observation maps there. The model still does the hard part — which record does this belong
-to, did the customer really commit, is this image a receipt or the source document, is this a
-draft or the final.
+**The model reports OBSERVATIONS → code records MILESTONES → status is a PROJECTION.**
+
+The model never emits a status. It emits evidence-backed observations (`payment_received`,
+`draft_sent`, `final_delivered`), each of which writes a durable timestamped milestone, and
+`projectStatus()` derives the stage from those accumulated facts.
+
+Two failure classes become structurally impossible rather than prompt-discouraged: a customer
+typing "Done" (meaning *they paid*) cannot complete a record, and a draft cannot either.
+A third — the one that killed a naive observation→status reducer — needs the milestones:
+**work delivered before payment stays in the chase-payment stage, and completes automatically
+when payment later arrives**, even though the delivery evidence is by then old context.
+
+The model still does the hard part: which record this belongs to, whether the customer really
+committed, whether this image is a receipt or the source document, draft or final.
 
 ---
 

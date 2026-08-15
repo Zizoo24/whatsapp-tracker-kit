@@ -32,9 +32,15 @@ const path = require('path');
 const { VALID_STATUS, RECORD_FIELDS } = require('./lib/status-model.cjs');
 const { normalizeCell } = require('./lib/sheet-normalize.cjs');
 const { loadEnv } = require('./lib/agent-provider.cjs');
+const { acquireRunLock, releaseRunLock } = require('./lib/run-lock.cjs');
 
 const ROOT = path.join(__dirname, '..');
 const BACKUP_DIR = path.join(ROOT, 'backups');
+// THE SAME lock the automated writer takes. Documentation told the operator to disable the
+// scheduled task and wait for this file to clear — but a documented procedure is not a
+// guarantee, and a tick that fires mid-apply is a split-brain write. Taking the real lock
+// makes the watcher skip its tick automatically, so safety is ENFORCED rather than advised.
+const LOCK = path.join(ROOT, '.tracker-lock');
 const MAX_SNAPSHOT_AGE_MIN = 60;
 
 // Fields a human may correct. `status` is included precisely because an operator must be
@@ -210,48 +216,67 @@ async function apply(options) {
   if (!plan.writes.length) return { applied: true, plan, pushed: 0 };
 
   const agent = resolveAgent(options);
-  const { cfg, sheet } = await io();
-  assertUnchanged(plan, await sheet.fetchRows(cfg, 'Records'));
-  const backupPath = backup(plan, agent);
 
-  // Name every field being blanked, so the store clears exactly those cells and nothing
-  // else. The blanket replaceEmpty flag would erase fields this correction never mentioned.
-  const rows = plan.writes.map((w) => {
-    const row = { record_id: w.record_id };
-    const clear = [];
-    for (const f of w.changed_fields) {
-      if (f === 'record_id') continue;
-      row[f] = w.after[f];
-      if (String(w.after[f] || '') === '') clear.push(f);
-    }
-    if (clear.length) row.clear_fields = clear;
-    return row;
-  });
-  await sheet.appendRows(rows, cfg, 'Records');
+  // Take the writer lock BEFORE reading live state, so the automated lane cannot slip a tick
+  // between our concurrency check and our write.
+  const lock = acquireRunLock(LOCK);
+  if (!lock.acquired) {
+    throw new Error('the tracker writer lock is held (pid ' + (lock.owner?.pid || '?')
+      + ') — the automated lane is mid-tick. Retry in a moment, or stop the scheduled task first.');
+  }
 
-  // READBACK: verify every asserted cell actually landed. Reporting success without this is
-  // reporting an intention.
-  const after = new Map((await sheet.fetchRows(cfg, 'Records')).map((r) => [String(r.record_id), normalizeRow(r)]));
-  const failures = [];
-  for (const w of plan.writes) {
-    const live = after.get(w.record_id);
-    if (!live) { failures.push({ record_id: w.record_id, error: 'row absent after write' }); continue; }
-    for (const f of w.changed_fields) {
-      if (String(live[f] || '') !== String(w.after[f] || '')) {
-        failures.push({ record_id: w.record_id, field: f, expected: w.after[f], actual: live[f] });
+  try {
+    const { cfg, sheet } = await io();
+    assertUnchanged(plan, await sheet.fetchRows(cfg, 'Records'));
+    const backupPath = backup(plan, agent);
+
+    // Name every field being blanked, so the store clears exactly those cells and nothing
+    // else. The blanket replaceEmpty flag would erase fields this correction never mentioned.
+    const rows = plan.writes.map((w) => {
+      const row = { record_id: w.record_id };
+      const clear = [];
+      for (const f of w.changed_fields) {
+        if (f === 'record_id') continue;
+        row[f] = w.after[f];
+        if (String(w.after[f] || '') === '') clear.push(f);
+      }
+      if (clear.length) row.clear_fields = clear;
+      return row;
+    });
+    await sheet.appendRows(rows, cfg, 'Records');
+
+    // READBACK: verify every asserted cell actually landed. Reporting success without this
+    // is reporting an intention.
+    const after = new Map((await sheet.fetchRows(cfg, 'Records')).map((r) => [String(r.record_id), normalizeRow(r)]));
+    const failures = [];
+    for (const w of plan.writes) {
+      const live = after.get(w.record_id);
+      if (!live) { failures.push({ record_id: w.record_id, error: 'row absent after write' }); continue; }
+      for (const f of w.changed_fields) {
+        if (String(live[f] || '') !== String(w.after[f] || '')) {
+          failures.push({ record_id: w.record_id, field: f, expected: w.after[f], actual: live[f] });
+        }
       }
     }
-  }
-  if (failures.length) {
-    throw new Error('READBACK FAILED — the store does not match what was written: '
-      + JSON.stringify(failures) + ' | rows restored from ' + backupPath);
-  }
+    if (failures.length) {
+      // Be precise about what did and did not happen. An earlier version claimed rows were
+      // "restored from" the backup — nothing was restored; a backup was merely taken first.
+      // A false rollback claim is worse than no rollback, because it stops the operator
+      // investigating a store that is now in an unknown state.
+      throw new Error('READBACK FAILED — the store does not match what was written: '
+        + JSON.stringify(failures)
+        + ' | NO automatic rollback was performed. Pre-write values are in ' + backupPath
+        + ' — inspect the store and restore manually if needed.');
+    }
 
-  return {
-    applied: true, agent, backup: backupPath,
-    pushed: rows.length, readback_verified: true,
-    plan,
-  };
+    return {
+      applied: true, agent, backup: backupPath,
+      pushed: rows.length, readback_verified: true,
+      plan,
+    };
+  } finally {
+    releaseRunLock(lock);
+  }
 }
 
 async function inspect(recordId) {
@@ -270,8 +295,8 @@ function usage() {
     '  node scripts/tracker-admin.cjs apply --snapshot FILE --proposal FILE --confirm APPROVED --agent NAME',
     '  node scripts/tracker-admin.cjs inspect --record RECORD_ID',
     '',
-    'Before ANY apply, stop the automated lane and wait for .tracker-lock to clear.',
-    'Two writers on one store is a split-brain that costs a day of reconciliation.',
+    'apply takes the SAME .tracker-lock the automated writer uses, so a tick cannot run',
+    'concurrently. Stopping the scheduled task first is still tidier for a long session.',
   ].join('\n');
 }
 

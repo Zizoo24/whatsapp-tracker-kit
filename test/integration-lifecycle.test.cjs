@@ -1,35 +1,40 @@
 'use strict';
-// INTEGRATION: validator -> writer. This is the test class v1 lacked entirely.
+// INTEGRATION: validator -> writer. This is the test class v1.0 lacked entirely.
 //
-// v1's units all passed while the two layers disagreed: the validator explicitly ALLOWED
-// `done -> revision`, and the writer's raw rank comparison classified it as a downgrade and
-// silently discarded the status. Each layer was individually "correct". The contract between
-// them was broken (docs/GUARDS.md #22).
+// v1.0's units all passed while the two layers disagreed: the validator ALLOWED
+// `done -> revision` and the writer's rank comparison silently discarded it (GUARDS #22).
+// Each layer was individually correct; the CONTRACT between them was broken.
 //
-// These tests exercise the real validated output through the real derivation the writer
-// performs, so a future divergence fails here rather than in production.
+// These tests drive real validated output through the exact derivation tracker-apply
+// performs, so a future divergence fails here instead of in production.
 
 const test = require('node:test');
 const assert = require('node:assert');
 const { validateAndNormalizeClientResult } = require('../scripts/lib/client-result.cjs');
-const { reduceObservations } = require('../scripts/lib/status-model.cjs');
+const { mergeMilestones, projectStatus } = require('../scripts/lib/status-model.cjs');
 
 const PHONE = '971500000000';
 const DONE_ID = PHONE + '_2026-08-01#abc';
+const DONE_MILESTONES = JSON.stringify({
+  committed_at: '2026-08-01T09:00:00Z',
+  paid_at: '2026-08-01T10:00:00Z',
+  final_delivered_at: '2026-08-01T12:00:00Z',
+});
 
-const input = (rows = [{ record_id: DONE_ID, status: 'done' }]) => ({
+const input = (rows = []) => ({
   phone: PHONE,
   existing_rows: rows,
-  context: [{ id: 'old', ts: '2026-08-01 10:00', from: 'CUSTOMER', text: 'earlier' }],
+  context: [{ id: 'old', ts: '2026-08-01T08:00:00Z', seq: 1, from: 'CUSTOMER', text: 'earlier' }],
   new_messages: [
-    { id: 'm1', ts: '2026-08-15 10:00', from: 'CUSTOMER', text: 'please change the spelling' },
-    { id: 'm2', ts: '2026-08-15 11:00', from: 'BUSINESS', text: 'payment received' },
+    { id: 'm1', ts: '2026-08-15T10:00:00Z', seq: 10, from: 'CUSTOMER', text: 'please fix the spelling' },
+    { id: 'm2', ts: '2026-08-15T10:00:30Z', seq: 11, from: 'BUSINESS', text: 'payment received' },
+    { id: 'm3', ts: '2026-08-15T10:00:45Z', seq: 12, from: 'BUSINESS', text: 'final certified file attached' },
   ],
 });
 
-// What tracker-apply actually does with a validated record.
-const writerDerives = (currentStatus, record) =>
-  reduceObservations(currentStatus, record.observations).status;
+// Exactly what tracker-apply does with a validated record.
+const writerDerives = (storedMilestones, record) =>
+  projectStatus(mergeMilestones(storedMilestones, record.observations).milestones);
 
 test('a post-delivery revision survives the FULL validator -> writer path', () => {
   const validated = validateAndNormalizeClientResult({
@@ -39,14 +44,13 @@ test('a post-delivery revision survives the FULL validator -> writer path', () =
       record_id: DONE_ID,
       observations: [{ type: 'revision_requested', evidence_msg_ids: ['m1'] }],
     }],
-  }, input());
+  }, input([{ record_id: DONE_ID, status: 'done', milestones: DONE_MILESTONES }]));
 
-  assert.equal(validated.records[0].status, 'revision', 'validator must accept it');
-  assert.equal(writerDerives('done', validated.records[0]), 'revision',
-    'the WRITER must also accept it — v1 silently discarded this exact move');
+  assert.equal(writerDerives(DONE_MILESTONES, validated.records[0]), 'revision',
+    'v1.0 accepted this at validation and silently discarded it at the writer');
 });
 
-test('a stale re-read of an old payment cannot walk a completed record backwards', () => {
+test('a stale re-read of an old payment cannot change a completed record', () => {
   assert.throws(() => validateAndNormalizeClientResult({
     phone: PHONE,
     records: [{
@@ -54,53 +58,74 @@ test('a stale re-read of an old payment cannot walk a completed record backwards
       record_id: DONE_ID,
       observations: [{ type: 'payment_received', evidence_msg_ids: ['m2'] }],
     }],
-  }, input()), /cannot be advanced/);
+  }, input([{ record_id: DONE_ID, status: 'done', milestones: DONE_MILESTONES }])),
+  /not changed by these observations/);
 });
 
-test('the model may not emit a status — that boundary is enforced, not merely documented', () => {
+test('the model may not emit a status — enforced, not merely documented', () => {
   assert.throws(() => validateAndNormalizeClientResult({
     phone: PHONE,
     records: [{
       kind: 'update', record_id: DONE_ID, status: 'paid',
       observations: [{ type: 'revision_requested', evidence_msg_ids: ['m1'] }],
     }],
-  }, input()), /must not carry status/);
+  }, input([{ record_id: DONE_ID, status: 'done', milestones: DONE_MILESTONES }])),
+  /must not carry status/);
 });
 
-test('a new record derives its stage from observations alone, end to end', () => {
+test('a new record delivered while unpaid stays confirmed_unpaid end to end', () => {
   const validated = validateAndNormalizeClientResult({
     phone: PHONE,
     records: [{
-      kind: 'new',
-      order_anchor_id: 'm1',
-      start_date: '2026-08-15',
-      doc_type: 'passport',
+      kind: 'new', order_anchor_id: 'm1', start_date: '2026-08-15', doc_type: 'passport',
       observations: [
+        { type: 'order_committed', evidence_msg_ids: ['m1'] },
+        { type: 'final_delivered', evidence_msg_ids: ['m3'] },
+      ],
+    }],
+  }, input());
+
+  const rec = validated.records[0];
+  assert.match(rec.record_id, /^\d+_\d{4}-\d{2}-\d{2}#[0-9a-f]{10}$/);
+  assert.equal(writerDerives({}, rec), 'confirmed_unpaid',
+    'delivering early must not stop us chasing payment');
+});
+
+test('sub-minute evidence ordering is exact (payment and delivery in the same minute)', () => {
+  // m2 (payment, seq 11) and m3 (delivery, seq 12) fall inside ONE minute. v1.1 truncated
+  // timestamps to the minute, so their order — which decides paid vs done — was arbitrary.
+  const validated = validateAndNormalizeClientResult({
+    phone: PHONE,
+    records: [{
+      kind: 'new', order_anchor_id: 'm1', start_date: '2026-08-15',
+      observations: [
+        { type: 'final_delivered', evidence_msg_ids: ['m3'] },
         { type: 'order_committed', evidence_msg_ids: ['m1'] },
         { type: 'payment_received', evidence_msg_ids: ['m2'] },
       ],
     }],
-  }, input([]));
+  }, input());
 
-  const rec = validated.records[0];
-  assert.equal(rec.status, 'paid');
-  assert.match(rec.record_id, /^\d+_\d{4}-\d{2}-\d{2}#[0-9a-f]{10}$/);
-  assert.equal(writerDerives(null, rec), 'paid', 'writer and validator must agree');
+  const order = validated.records[0].observations.map((o) => o.type);
+  assert.deepEqual(order, ['order_committed', 'payment_received', 'final_delivered'],
+    'observations must be ordered by ingestion seq, not by model output order');
+  assert.equal(writerDerives({}, validated.records[0]), 'done');
 });
 
-test('evidence must come from new_messages — context can never justify a write', () => {
+test('evidence must be new — context can never justify a write', () => {
   assert.throws(() => validateAndNormalizeClientResult({
     phone: PHONE,
     records: [{
       kind: 'new', order_anchor_id: 'old', start_date: '2026-08-15',
       observations: [{ type: 'order_committed', evidence_msg_ids: ['old'] }],
     }],
-  }, input([])), /not is_new/);
+  }, input()), /not new evidence/);
 });
 
 test('a record with no observations is refused rather than written blank', () => {
   assert.throws(() => validateAndNormalizeClientResult({
     phone: PHONE,
     records: [{ kind: 'update', record_id: DONE_ID, observations: [] }],
-  }, input()), /at least one observation/);
+  }, input([{ record_id: DONE_ID, status: 'done', milestones: DONE_MILESTONES }])),
+  /at least one observation/);
 });

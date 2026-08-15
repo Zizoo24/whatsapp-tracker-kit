@@ -288,12 +288,16 @@ const extractCounterparty = (file) => extractFile(file, COUNTERPARTY_RULES,
         .filter((u) => u && typeof u.record_id === 'string' && eligible[u.record_id]);
 
       for (const u of updates) {
-        // Handing an eligible record to a counterparty means work is underway. Never
-        // DOWNGRADE a further stage (e.g. revision) back to the in-progress stage.
-        const newStatus = eligible[u.record_id] === 'paid' ? 'translating' : eligible[u.record_id];
-        const merged = mergeCounterpartyUpdate(results, u.record_id, v.counterparty, newStatus);
+        // Handing an eligible record to a counterparty means WORK HAS STARTED. Emitting that
+        // as a milestone observation — rather than a status — keeps every lane going through
+        // the same projection, so a handoff can never overwrite a further stage.
+        const merged = mergeCounterpartyUpdate(results, u.record_id, v.counterparty, {
+          type: 'work_started',
+          at: u.at || u.ts || '',
+          evidence_msg_ids: u.evidence_msg_id ? [u.evidence_msg_id] : [],
+        });
         if (merged.added) {
-          log('  counterparty:' + v.counterparty + ' -> ' + u.record_id + ' [' + newStatus + '] ('
+          log('  counterparty:' + v.counterparty + ' -> ' + u.record_id + ' [work_started] ('
             + String(u.evidence || '').slice(0, 70) + ')');
         } else if (merged.reason === 'customer_pass_terminal') {
           log('  counterparty:' + v.counterparty + ' skipped ' + u.record_id + ' (customer pass already terminal)');

@@ -1,48 +1,41 @@
 'use strict';
-// status-model.cjs — SEAM 2. The lifecycle model AND its deterministic reducer.
+// status-model.cjs — SEAM. The lifecycle model: observations -> durable milestones -> status.
 //
 // ============================================================================
 // THIS IS ONE OF THE FILES YOU ADAPT PER DEPLOYMENT. See docs/PORTING.md.
 // ============================================================================
 //
-// THE CENTRAL BOUNDARY: the model reports OBSERVATIONS. Code derives STATE.
+// THE THREE-LAYER BOUNDARY:
 //
-// The model never emits a status. It emits evidence-backed observations ("payment
-// received here", "final delivered here") and this file maps them to a stage. That single
-// move deletes a whole class of failure that prompt engineering could only ever discourage:
+//   the model     reports OBSERVATIONS   ("payment landed here", "final sent here")
+//   this file     records MILESTONES     (durable timestamped facts about the past)
+//   this file     projects STATUS        (a pure function of the milestones)
 //
-//   - A customer typing "Done" (meaning "I paid") cannot become the terminal stage,
-//     because the only observation it supports is `payment_received`.
-//   - A draft cannot complete a record, because `draft_sent` maps to the in-progress
-//     stage. It is structurally incapable of meaning "finished".
+// WHY MILESTONES AND NOT A DIRECT OBSERVATION->STATUS REDUCER (this cost a regression):
 //
-// The model still does the genuinely hard work — WHICH record does this message belong to,
-// did the customer actually commit, is this image a receipt or the source document, is this
-// a draft or the final. Code must not try to guess those. But "what stage does a confirmed
-// payment imply" is mechanically definable, so it belongs here.
+// A reducer that maps the NEWEST observation to a stage has no memory. Two real translation
+// scenarios break it:
 //
-// TWO RULES THAT SURVIVE ANY DOMAIN:
+//   1. WORK DELIVERED BEFORE PAYMENT. A customer commits, we deliver early, they have not
+//      paid. A forward-ranked reducer sees `final_delivered` and concludes "done". But the
+//      next commercial action is still CHASE PAYMENT. Unpaid is unpaid even when delivered.
 //
-// RULE A — STATUS IS A PURE LIFECYCLE STAGE. Status answers "WHERE is this record". It
-//   never answers "WHO is doing the work" — that is a separate COLUMN. Collapsing the two
-//   axes meant a counterparty stamp could overwrite a real stage, and a price-quote forward
-//   looked identical to a real handoff. See docs/GUARDS.md #10 and #11.
+//   2. THE DAY-2 AMNESIA. Day 1: committed and delivered, unpaid. Day 2: payment arrives.
+//      By then the delivery is old context and can no longer be cited as fresh evidence, so
+//      a memoryless reducer sees only `payment_received` and lands on "paid" — silently
+//      forgetting that the job was already finished.
 //
-// RULE B — TRANSITIONS ARE EXPLICIT, NOT A RANK COMPARISON. Rank alone gets the common
-//   case right and the important case wrong: a post-delivery revision is a legitimate
-//   BACKWARD move, and a naive `rank(next) < rank(current)` guard silently refuses it.
-//   That exact mismatch shipped in v1 — the validator accepted `done -> revision` while the
-//   writer discarded it. Use canAutomatedTransition(). See docs/GUARDS.md #22.
+// Milestones fix both because they are FACTS THAT PERSIST. Status is then a projection, not
+// an accumulation of guesses. This is the event-ledger insight without the ledger: eight
+// timestamps in one column, not an event store.
 
 // ---- Stages (DOMAIN: rename freely) ---------------------------------------------------
-// Ordered lifecycle. Index = rank. Rank is still used for ordering and reporting, but it
-// is NEVER the sole authority on whether a move is legal.
 const STAGES = [
   'confirmed_unpaid', // committed, money not in       -> chase payment
   'paid',             // money in, work not started    -> assign / start
   'translating',      // work underway (by anyone)     -> finish / deliver
   'revision',         // delivered, changes requested  -> fix
-  'done',             // completed successfully        -> terminal
+  'done',             // paid AND delivered            -> terminal
 ];
 
 // TERMINAL-DEAD states: the record ended without completing. They must be REPRESENTABLE,
@@ -55,43 +48,26 @@ const STATUS_RANK = Object.fromEntries([...STAGES, ...DEAD_STAGES].map((n, i) =>
 const TERMINAL_STATUS = new Set(['done', ...DEAD_STAGES]);
 
 // ---- Observations (what the MODEL is allowed to say) ----------------------------------
-// Each observation is a claim about evidence, not a claim about state. Rename these with
-// your stages, but keep the shape: every observation must name a concrete, checkable event.
-//
-// `draft_sent` deliberately maps to the in-progress stage, NOT to completion. That is the
-// draft-vs-final rule (GUARDS #17) made structural instead of advisory.
-const OBSERVATION_STAGE = Object.freeze({
-  order_committed: 'confirmed_unpaid',
-  payment_received: 'paid',
-  work_started: 'translating',
-  draft_sent: 'translating',
-  final_delivered: 'done',
-  revision_requested: 'revision',
-  order_cancelled: 'cancelled',
-  payment_refunded: 'refunded',
+// Each is a claim about evidence, never about state. Every observation writes exactly one
+// milestone.
+const OBSERVATION_MILESTONE = Object.freeze({
+  order_committed: 'committed_at',
+  payment_received: 'paid_at',
+  work_started: 'work_started_at',
+  draft_sent: 'draft_sent_at',
+  final_delivered: 'final_delivered_at',
+  revision_requested: 'revision_requested_at',
+  order_cancelled: 'cancelled_at',
+  payment_refunded: 'refunded_at',
 });
 
-const OBSERVATIONS = Object.keys(OBSERVATION_STAGE);
-
-// Observations that may legally move a COMPLETED record. Everything else is forward-only.
-// A post-delivery revision, a late cancellation, and a refund are all real; a stale
-// re-reading of an old payment is not.
-const POST_COMPLETION_OBSERVATIONS = new Set([
-  'revision_requested', 'order_cancelled', 'payment_refunded',
-]);
-
-// The only transitions out of a terminal status, and only on fresh evidence.
-const TERMINAL_TRANSITIONS = {
-  done: new Set(['revision', 'cancelled', 'refunded']),
-  cancelled: new Set(['refunded']),
-  refunded: new Set(),
-};
+const OBSERVATIONS = Object.keys(OBSERVATION_MILESTONE);
+const MILESTONES = Object.values(OBSERVATION_MILESTONE);
 
 // STRUCTURAL GUARD (GUARDS #11): only records at or beyond this point may be seen by the
 // counterparty/handoff pass. We routinely forward a document to a counterparty JUST TO GET
 // A PRICE QUOTE before the customer has committed or paid, so a quote-check must never be
-// visible as a handoff candidate. Do NOT widen this to include the committed-but-unpaid
-// stage.
+// visible as a handoff candidate. Do NOT widen this to the committed-but-unpaid stage.
 const HANDOFF_ELIGIBLE = new Set(['paid', 'translating', 'revision']);
 
 // Non-status fields an extraction pass may write. An allowlist, so a hallucinated key can
@@ -100,94 +76,144 @@ const RECORD_FIELDS = [
   'client_name', 'doc_type', 'language_pair', 'price', 'delivery_time', 'summary',
 ];
 
-/**
- * Decide whether an AUTOMATED lane may move `current` -> `next`.
- *
- * Replaces the raw rank comparison that produced the v1 validator/writer mismatch.
- * Returns { allowed, reason } so callers can log WHY a move was refused — a silent refusal
- * is indistinguishable from a bug.
- *
- * An operator correction does NOT go through here: a human may set any valid status,
- * which is exactly why this guard must live at the automated writer and never in the
- * store API (the API is also the repair path — GUARDS #13).
- */
-function canAutomatedTransition(current, next, observation = null) {
-  if (!VALID_STATUS.has(next)) return { allowed: false, reason: 'invalid_target:' + next };
-  // Creation: nothing to move from.
-  if (current == null || current === '') return { allowed: true, reason: 'creation' };
-  if (!VALID_STATUS.has(current)) {
-    // A legacy or hand-typed status we cannot reason about. Refuse rather than guess —
-    // and surface it, because a human needs to look.
-    return { allowed: false, reason: 'unrankable_current:' + current };
+const isBlank = (v) => v === null || v === undefined || String(v).trim() === '';
+
+// Compare two timestamps as instants. String comparison is WRONG here: the mirror writes
+// '2026-07-08 09:21:01+04:00' while other layers write ISO 'Z' form, and lexically the
+// former looks larger even when it is the same or an earlier instant.
+function tsToEpoch(value) {
+  if (isBlank(value)) return null;
+  let t = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2} /.test(t)) t = t.replace(' ', 'T');
+  if (!/(?:[Zz]|[+-]\d{2}:?\d{2})$/.test(t)) t += 'Z';
+  const n = Date.parse(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+const laterTs = (a, b) => {
+  const ea = tsToEpoch(a);
+  const eb = tsToEpoch(b);
+  if (ea === null) return b;
+  if (eb === null) return a;
+  return eb > ea ? b : a;
+};
+
+function parseMilestones(raw) {
+  let source = raw;
+  if (typeof raw === 'string') {
+    if (!raw.trim()) return {};
+    try { source = JSON.parse(raw); } catch { return {}; }
   }
-  if (current === next) return { allowed: false, reason: 'no_op' };
-
-  if (TERMINAL_STATUS.has(current)) {
-    if (!TERMINAL_TRANSITIONS[current].has(next)) {
-      return { allowed: false, reason: 'terminal_transition_forbidden:' + current + '->' + next };
-    }
-    // A terminal record may only be moved by an observation that genuinely implies it.
-    if (observation && !POST_COMPLETION_OBSERVATIONS.has(observation)) {
-      return { allowed: false, reason: 'observation_cannot_reopen:' + observation };
-    }
-    return { allowed: true, reason: 'terminal_transition_allowed' };
-  }
-
-  // Non-terminal: forward moves are fine; a terminal-dead outcome may arrive at any time.
-  if (STATUS_RANK[next] > STATUS_RANK[current]) return { allowed: true, reason: 'forward' };
-  if (DEAD_STAGES.includes(next)) return { allowed: true, reason: 'terminal_dead' };
-
-  // THE GUARD THAT MATTERS (GUARDS #13): the extractor re-emits historical records every
-  // run, so a stale re-read tries to walk a record backwards. Refuse.
-  return { allowed: false, reason: 'downgrade_refused:' + current + '->' + next };
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return {};
+  const out = {};
+  for (const key of MILESTONES) if (!isBlank(source[key])) out[key] = String(source[key]);
+  return out;
 }
 
 /**
- * Derive a status from the current status plus the observations this run produced.
+ * Merge new observations into the stored milestones. Milestones only ever ACCUMULATE —
+ * they are facts about the past, and forgetting one is what caused the Day-2 amnesia bug.
  *
- * Pure: no clock, no I/O. Observations are applied in the order given (callers pass them in
- * evidence order), so a record that is committed, paid and delivered within one delta walks
- * the whole lifecycle in a single pass.
+ * LATEST WINS per milestone. That is what makes a second revision cycle work:
+ * deliver -> revise -> deliver again advances `final_delivered_at` past
+ * `revision_requested_at`, so the projection returns to "done".
  *
- * Returns { status, applied[], refused[] } — refusals are data, not silence, so the caller
- * can log exactly which evidence was declined and why.
+ * Pure: no clock, no I/O.
  */
-function reduceObservations(currentStatus, observations = []) {
-  let status = currentStatus == null || currentStatus === '' ? null : String(currentStatus).trim();
+function mergeMilestones(existing, observations = []) {
+  const milestones = parseMilestones(existing);
   const applied = [];
   const refused = [];
 
   for (const raw of observations) {
-    const type = typeof raw === 'string' ? raw : String(raw && raw.type || '');
-    const target = OBSERVATION_STAGE[type];
-    if (!target) {
-      refused.push({ observation: type, reason: 'unknown_observation' });
-      continue;
-    }
-    const verdict = canAutomatedTransition(status, target, type);
-    if (verdict.allowed) {
-      status = target;
-      applied.push({ observation: type, status: target });
-    } else {
-      refused.push({ observation: type, reason: verdict.reason });
-    }
+    const type = typeof raw === 'string' ? raw : String((raw && raw.type) || '');
+    const key = OBSERVATION_MILESTONE[type];
+    if (!key) { refused.push({ observation: type, reason: 'unknown_observation' }); continue; }
+    // An observation with no usable timestamp still proves the event happened; fall back to
+    // a sentinel so the fact is not lost. Ordering-sensitive projections handle blanks.
+    const at = (raw && raw.at) || (raw && raw.ts) || '';
+    if (isBlank(at)) { refused.push({ observation: type, reason: 'missing_timestamp' }); continue; }
+    milestones[key] = laterTs(milestones[key], String(at));
+    applied.push({ observation: type, milestone: key, at: milestones[key] });
   }
 
-  return { status, applied, refused };
+  return { milestones, applied, refused };
+}
+
+/**
+ * Project a status from milestones. PURE — this is the single authority on what a record's
+ * stage is, and the only place the business ordering rules live.
+ *
+ * ORDER MATTERS. Each clause below is a commercial rule:
+ *   refunded/cancelled  terminal-dead outcomes win over everything.
+ *   NOT paid            unpaid is unpaid EVEN IF DELIVERED — the next action is still
+ *                       "chase payment". This clause is the whole reason milestones exist.
+ *   revision            a revision requested AFTER the latest delivery reopens the work.
+ *   delivered           paid AND delivered = done.
+ *   started             work underway (a draft counts as underway, never as finished).
+ *   otherwise           paid, waiting to start.
+ */
+function projectStatus(milestones) {
+  const m = parseMilestones(milestones);
+  if (m.refunded_at) return 'refunded';
+  if (m.cancelled_at) return 'cancelled';
+
+  // THE RULE THE OBSERVATION REDUCER LOST: delivery does not complete an unpaid record.
+  if (!m.paid_at) return 'confirmed_unpaid';
+
+  const delivered = tsToEpoch(m.final_delivered_at);
+  const revised = tsToEpoch(m.revision_requested_at);
+  if (revised !== null && (delivered === null || revised > delivered)) return 'revision';
+  if (delivered !== null) return 'done';
+  if (m.work_started_at || m.draft_sent_at) return 'translating';
+  return 'paid';
+}
+
+/**
+ * Whether an AUTOMATED lane may move `current` -> `next`.
+ *
+ * With milestone projection the monotonic guard is largely IMPLICIT — milestones only
+ * accumulate, so a stale re-read cannot walk a record backwards. This remains as the
+ * explicit gate for lanes that supply a status directly (the counterparty pass) and for
+ * refusing to reopen a terminal record.
+ *
+ * An operator correction does NOT pass through here: a human may set any valid status,
+ * which is exactly why this guard lives at the writer and never in the store API.
+ */
+function canAutomatedTransition(current, next) {
+  if (!VALID_STATUS.has(next)) return { allowed: false, reason: 'invalid_target:' + next };
+  if (isBlank(current)) return { allowed: true, reason: 'creation' };
+  if (!VALID_STATUS.has(current)) return { allowed: false, reason: 'unrankable_current:' + current };
+  if (current === next) return { allowed: false, reason: 'no_op' };
+  if (DEAD_STAGES.includes(current)) {
+    return current === 'cancelled' && next === 'refunded'
+      ? { allowed: true, reason: 'cancelled_to_refunded' }
+      : { allowed: false, reason: 'terminal_dead:' + current };
+  }
+  if (current === 'done') {
+    return ['revision', 'cancelled', 'refunded'].includes(next)
+      ? { allowed: true, reason: 'post_completion' }
+      : { allowed: false, reason: 'cannot_reopen_completed:' + next };
+  }
+  if (STATUS_RANK[next] > STATUS_RANK[current]) return { allowed: true, reason: 'forward' };
+  if (DEAD_STAGES.includes(next)) return { allowed: true, reason: 'terminal_dead' };
+  return { allowed: false, reason: 'downgrade_refused:' + current + '->' + next };
 }
 
 module.exports = {
   DEAD_STAGES,
   HANDOFF_ELIGIBLE,
+  MILESTONES,
   OBSERVATIONS,
-  OBSERVATION_STAGE,
-  POST_COMPLETION_OBSERVATIONS,
+  OBSERVATION_MILESTONE,
   RECORD_FIELDS,
   STAGES,
   STATUS_RANK,
   TERMINAL_STATUS,
-  TERMINAL_TRANSITIONS,
   VALID_STATUS,
   canAutomatedTransition,
-  reduceObservations,
+  mergeMilestones,
+  parseMilestones,
+  projectStatus,
+  tsToEpoch,
 };

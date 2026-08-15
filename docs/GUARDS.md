@@ -365,6 +365,80 @@ anything the correctness of a write depends on.
 
 ---
 
+---
+
+## #25 — A memoryless status reducer forgot that work was already delivered
+
+**Found by external audit of v1.1 — a regression introduced by v1.1's own fix.** Moving the
+model to observations was right; deriving status from the *newest observation* was not.
+
+Two real scenarios broke:
+
+1. **Delivered before payment.** Customer commits, we deliver early, they have not paid. The
+   reducer saw `final_delivered`, took the forward-ranked move, and reported **done** — so
+   the operator stopped chasing money they had never received. The original model was
+   explicit that **unpaid is unpaid even if delivered early**; the rewrite silently dropped
+   that rule.
+2. **Day-2 amnesia.** Day 1: committed and delivered, unpaid → `confirmed_unpaid`. Day 2:
+   payment lands. By then the delivery is *old context* and cannot be cited as fresh evidence
+   (correctly — see #12), so the reducer saw only `payment_received` and landed on **paid**,
+   forgetting the job was finished.
+
+The root cause is that a status is a **fold over history**, while the reducer only had the
+present.
+
+**Guard:** observations now write **durable milestones** — `committed_at`, `paid_at`,
+`work_started_at`, `draft_sent_at`, `final_delivered_at`, `revision_requested_at`,
+`cancelled_at`, `refunded_at` — stored in one JSON column. Status becomes a **pure
+projection** of those facts, with the commercial rules in one ordered function:
+
+```
+refunded_at                        -> refunded
+cancelled_at                       -> cancelled
+NOT paid_at                        -> confirmed_unpaid   <- the rule that was lost
+revision_at after latest delivery  -> revision
+final_delivered_at                 -> done
+work_started_at or draft_sent_at   -> translating
+otherwise                          -> paid
+```
+
+This is the event-ledger insight without the ledger. It also makes the monotonic guard
+**implicit**: milestones only accumulate, so a stale re-read cannot walk a record backwards.
+
+**Meta-lesson:** when a rewrite deletes a failure class, check what *invariants* the old code
+was also carrying. Here the removed `STATUS_RANK` comparison had been quietly enforcing "you
+cannot be done before you are paid."
+
+---
+
+## #26 — Minute-truncated timestamps could not order same-minute evidence
+
+**Found by external audit of v1.1.** Prep truncated message timestamps to the minute while
+validation ordered observations by that timestamp. A payment confirmation and a file send
+routinely land in the same minute, and their order decides paid-versus-delivered.
+
+**Guard:** prep carries the **full timestamp plus the mirror's rowid as `seq`**, and
+validation sorts on `seq` — exact ingestion order — falling back to the timestamp only for
+hand-built fixtures.
+
+---
+
+## #27 — The correction tool advised a lock instead of taking it
+
+**Found by external audit of v1.1.** `tracker-admin` told the operator to stop the scheduled
+writer and wait for `.tracker-lock` to clear, but never acquired that lock itself. A tick
+firing mid-apply would produce exactly the split-brain the instruction warned about.
+
+Its readback-failure message also claimed rows were *"restored from"* the backup. **Nothing
+was restored** — a backup had merely been taken beforehand. A false rollback claim is worse
+than no rollback: it stops the operator investigating a store now in an unknown state.
+
+**Guards:** `apply` acquires the **same** `.tracker-lock` (so the watcher skips its tick
+automatically — safety enforced, not advised), and the failure message now states plainly
+that no automatic rollback was performed and points at the backup.
+
+---
+
 ## The meta-lessons
 
 1. **Never advance a cursor over a message you did not show the model.** Every
@@ -385,5 +459,14 @@ anything the correctness of a write depends on.
    added for cost that quietly re-opened the data-loss class the cursor exists to close.
    When adding a limit, ask what it is allowed to drop.
 10. **Let code decide what code can decide.** Moving status derivation out of the model
-    (observations → reducer) deleted a whole class of prompt-only safeguards. The model
-    should be asked only what genuinely requires reading comprehension.
+    (observations → milestones → projection) deleted a whole class of prompt-only
+    safeguards. Ask the model only what genuinely requires reading comprehension.
+11. **State is a fold over history, not a function of the latest event.** #25 is what
+    happens when a lifecycle is derived from the newest observation instead of the durable
+    facts. If a rule depends on something that happened last week, the system must still
+    know it happened.
+12. **A rewrite inherits invariants it never names.** #25's removed rank comparison had been
+    quietly enforcing "you cannot be done before you are paid." Before deleting a guard,
+    list everything it was accidentally protecting.
+13. **Never claim a recovery action you did not perform.** #27's "rows restored" message
+    would have sent an operator away from a store in an unknown state.
