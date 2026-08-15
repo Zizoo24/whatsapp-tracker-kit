@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep the WhatsApp bridge alive, every 5 minutes and at boot
+
+[Timer]
+# OnBootSec is the Linux equivalent of the Windows logon trigger. Repetition alone never
+# covers a boot — that gap caused a 66-hour zero-ingestion outage.
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+AccuracySec=30s
+Unit=tracker-keepalive.service
+
+[Install]
+WantedBy=timers.target

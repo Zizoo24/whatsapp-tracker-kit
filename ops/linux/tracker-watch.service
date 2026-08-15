@@ -1,0 +1,17 @@
+[Unit]
+Description=WhatsApp tracker extraction lane (prep -> model -> apply)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/whatsapp-tracker-kit
+# Long-lived headless auth. A normal login token expires ~daily and a headless subprocess
+# cannot refresh it. See docs/GUARDS.md #12.
+EnvironmentFile=-/path/to/whatsapp-tracker-kit/agent-token.env
+ExecStartPre=/usr/bin/env node --check scripts/tracker-watch.cjs
+ExecStart=/usr/bin/env node scripts/tracker-watch.cjs
+# The run lock already prevents overlap; this is a second belt so a wedged tick cannot
+# hold a slot forever.
+TimeoutStartSec=1200
+StandardOutput=append:/path/to/whatsapp-tracker-kit/watch.log
+StandardError=append:/path/to/whatsapp-tracker-kit/watch.log

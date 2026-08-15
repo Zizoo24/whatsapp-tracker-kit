@@ -1,0 +1,29 @@
+# Secrets — never commit.
+.env
+agent-token.env
+
+# Local databases and any snapshot of them. These hold real conversation content.
+*.db
+*.db-wal
+*.db-shm
+store/
+backups/
+
+# Runtime state and working directories. .tracker-work holds RAW CONVERSATIONS.
+.tracker-work/
+tracker-state.json
+state.json
+.tracker-lock
+.bridge-stale-restart
+.bridge-supervision-state.json
+.alert-*
+
+# Logs
+*.log
+
+# Proposal/snapshot artifacts from the agent lane — these contain message content.
+*-snapshot.json
+*-proposal.json
+*-plan.json
+
+node_modules/

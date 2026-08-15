@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-tracker-kit",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Portable WhatsApp -> spreadsheet tracker: message stream -> rowid cursor -> one LLM judgment step -> idempotent upsert.",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check scripts/tracker-watch.cjs && node --check scripts/tracker-prep.cjs && node --check scripts/tracker-apply.cjs && node --check scripts/bridge-keepalive.cjs",
+    "prep": "node --no-warnings=ExperimentalWarning scripts/tracker-prep.cjs",
+    "watch": "node --no-warnings=ExperimentalWarning scripts/tracker-watch.cjs",
+    "keepalive": "node --no-warnings=ExperimentalWarning scripts/bridge-keepalive.cjs",
+    "reconcile": "node --no-warnings=ExperimentalWarning cli.js reconcile",
+    "reconcile:dry": "node --no-warnings=ExperimentalWarning cli.js reconcile --dry-run"
+  }
+}

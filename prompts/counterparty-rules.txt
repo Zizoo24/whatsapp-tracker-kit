@@ -1,0 +1,20 @@
+We OUTSOURCE some customer work to a counterparty (a vendor / subcontractor / partner team). This is the COUNTERPARTY's WhatsApp chat with us (from=BUSINESS is us, from=COUNTERPARTY is them).
+Input JSON: {counterparty, in_flight, conversation}. Each conversation message has {id,ts,from,text,is_new}. in_flight = our PAID customer orders currently being worked (record_id, doc_type, language_pair, price, status, summary). These are already-paid orders only — do not infer payment from this chat.
+Identify which in_flight orders were evidently HANDED TO this counterparty to DO THE WORK (we sent them the document to work on / they are working on it / they returned the finished work but we have not yet delivered it to the customer). "Counterparty" identifies WHO is doing the work; it is NOT a status.
+
+Return ONLY valid JSON, no prose, no fences: {"updates":[{"record_id":"...","evidence":"one line"}],"reviews":[{"record_id":"...","reason":"counterparty_reports_customer_cancelled","evidence":"one line"}]}
+
+`updates` contains only orders handed to THIS counterparty. `reviews` contains only an in_flight order that NEW counterparty-chat evidence clearly says the CUSTOMER cancelled or stopped. A review never deletes or changes the order; only the operator may void it.
+
+Only messages with is_new:true may justify an update or review. Older messages are context only.
+
+When a new BUSINESS directive names a work type ("do the licence one now") and exactly one in_flight order matches that type, that is clear handoff evidence even if older context discussed a different order. Put a concise quote from the new message in evidence.
+
+HARD GUARDS (each is a real production incident):
+- Only include an order on CLEAR evidence: matching document type, filename, language pair, page count, or customer name. Do NOT guess from timing alone.
+- Do NOT include an order merely because its document appears here. We also forward documents to a counterparty JUST TO GET A PRICE QUOTE, which is NOT a handoff. If the order is not in in_flight, there is no event to emit — say nothing.
+- NEVER attribute an order to this counterparty unless the document/order is actually identifiable IN THIS CHAT. If you cannot point at a message HERE carrying that order's file, document type, or customer, return nothing for it. (A large medical job done by a DIFFERENT counterparty was once credited to this one, whose chat never contained those files.)
+- If the finished work was already delivered to the CUSTOMER, do not include it — the customer-chat pass owns the terminal status, and a counterparty stamp must never overwrite it.
+- Explicit multi-job references count as clear evidence when they name or match in_flight work: if BUSINESS says the counterparty has multiple jobs by language or document type ("you have the Russian and the Portuguese") and those labels clearly map to in_flight orders, emit one update for each matched order. A prior price-check document alone is still NOT a handoff — the multi-job reference must be in a new message, and a bare confirmation ("ok", "done", "confirmed") can support a match but cannot replace the BUSINESS handoff reference.
+
+If nothing matches: {"updates":[],"reviews":[]}. That is the correct answer most ticks.

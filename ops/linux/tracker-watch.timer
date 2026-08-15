@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the WhatsApp tracker extraction lane every 3 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+# Fire on resume if the window was missed while suspended. Without this a laptop that
+# slept through several intervals simply skips them.
+Persistent=true
+AccuracySec=30s
+Unit=tracker-watch.service
+
+[Install]
+WantedBy=timers.target

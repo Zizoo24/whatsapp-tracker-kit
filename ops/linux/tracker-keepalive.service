@@ -1,0 +1,12 @@
+[Unit]
+Description=WhatsApp bridge transport keepalive (no extraction, no store writes)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/whatsapp-tracker-kit
+ExecStartPre=/usr/bin/env node --check scripts/bridge-keepalive.cjs
+ExecStart=/usr/bin/env node scripts/bridge-keepalive.cjs
+TimeoutStartSec=300
+StandardOutput=append:/path/to/whatsapp-tracker-kit/bridge-keepalive.log
+StandardError=append:/path/to/whatsapp-tracker-kit/bridge-keepalive.log

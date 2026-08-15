@@ -1,0 +1,121 @@
+# whatsapp-tracker-kit
+
+Turn a live WhatsApp conversation stream into **one durable row per real business record**
+— order, ticket, lead, booking — using exactly one LLM judgment step surrounded by
+deterministic code.
+
+> A message stream → a deterministic scan bounded by a **rowid cursor** → **one model call
+> per chat** → an idempotent **upsert keyed by a stable record id**, with SQLite as memory
+> and monotonic guards protecting hard-won state.
+
+This is the portable distillation of a system that ran in production for months. Its guards
+are not defensive-programming habits — **each one is an incident that reached real data**.
+[docs/GUARDS.md](docs/GUARDS.md) is the most valuable file here.
+
+---
+
+## Why this exists
+
+Off-the-shelf CRMs cannot see your WhatsApp, and the official Business Cloud API **cannot
+see messages you send** from your own phone — which is fatal, because most lifecycle
+evidence is business-side: the quote, the payment link, the delivered file. Meanwhile
+"just ask an LLM to read the chat" fails differently: it re-reads history every run,
+re-emits finished records at earlier stages, invents records from polite acknowledgments,
+and attributes one customer's delivery to another's order.
+
+This kit is the boring machinery that makes the LLM step safe.
+
+---
+
+## Requirements
+
+- **Node ≥ 22.5** — uses built-in `node:sqlite` and `fetch`. **No `npm install`.**
+- A **WhatsApp bridge** mirroring messages to local SQLite ([bridge/README.md](bridge/README.md)).
+- A **Google Sheet** (or any store — `src/sheet.js` is the entire interface).
+- A **model CLI** — Claude Code, Codex, or any stdin→stdout command.
+
+---
+
+## Quick start
+
+```bash
+cp .env.example .env        # fill it in
+npm run check               # syntax preflight
+
+# 1. Inspect what would be sent to the model — BEFORE any model call
+node scripts/tracker-prep.cjs
+cat .tracker-work/manifest.json
+
+# 2. One full tick: supervise -> prep -> model -> apply
+node scripts/tracker-watch.cjs
+
+# 3. Schedule it (dry-run by default)
+powershell -File ops/windows/install-tasks.ps1          # -Execute to install
+#   or: see ops/linux/README.md
+```
+
+Full setup, including the store backend and the three seams you must adapt, is in
+[SKILL.md](SKILL.md) §3–4.
+
+---
+
+## Documentation
+
+| File | Read it when |
+|---|---|
+| **[SKILL.md](SKILL.md)** | **start here** — the agent front door, setup, diagnostics |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | you want the five moving parts and the failure model |
+| [docs/GUARDS.md](docs/GUARDS.md) | **before changing anything** — 21 production incidents |
+| [docs/PORTING.md](docs/PORTING.md) | adapting to your domain; the deployment checklist |
+| [docs/LEDGER-ARCHITECTURE.md](docs/LEDGER-ARCHITECTURE.md) | you need replay, provenance, durable corrections |
+| [prompts/TEMPLATE-NOTES.md](prompts/TEMPLATE-NOTES.md) | editing prompts — what is structural vs domain |
+| [bridge/README.md](bridge/README.md) | building the bridge; the required `/api/health` patch |
+| [agents/tracker-operator.md](agents/tracker-operator.md) | the agent lane for corrections and audits |
+
+---
+
+## The three seams
+
+Everything else ports unchanged.
+
+| Seam | File | What you change |
+|---|---|---|
+| 1. Extraction contract | `prompts/*.txt` | what the model looks for |
+| 2. Lifecycle model | `scripts/lib/status-model.cjs` | your stages and their rank |
+| 3. Store schema | `apps-script/Code.gs` → `SHEETS` | your columns |
+
+Change all three **together** — they must agree, or records are silently dropped.
+
+---
+
+## Five things that will bite you
+
+1. **Never revert the cursor to a timestamp.** rowid order ≠ timestamp order (20 inversions
+   per 4,000 messages, worst ~6 days late). A timestamp watermark makes late-arriving
+   messages **unreachable forever**.
+2. **Always open the live SQLite `{readOnly: true, timeout: 5000}`.** Without a *finite*
+   timeout, `node:sqlite` hangs on the bridge's live writes and the lane wedges.
+3. **Chats are keyed by `@lid`, not phone.** Query only the phone JID and an active chat is
+   invisible — no error, just no data.
+4. **Use a long-lived model token.** A normal login token expires ~daily and a headless
+   subprocess cannot refresh it: silent 401s, frozen cursor, everything *looks* healthy.
+   (A stray leading space in the token file also 401s.)
+5. **The monotonic guard belongs at the writer, never the store API** — the API is also the
+   correction path.
+
+---
+
+## Hard rules
+
+- Payment keys are **READ-ONLY**. This system is **tracking only**: it never messages a
+  customer, never creates or modifies a payment, never writes a payment link.
+- Never commit `.env`, `agent-token.env`, or any `*.db` — they hold secrets and real
+  conversation content. `.tracker-work/` holds raw conversations and is gitignored too.
+- Never run two writers concurrently. Disable the scheduled lane before an agent-lane apply.
+
+---
+
+## License
+
+Adapt freely. The bridge is a separate upstream project with its own license — see
+[bridge/README.md](bridge/README.md).
