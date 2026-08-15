@@ -1,45 +1,118 @@
-Extract committed CUSTOMER ORDER CHANGES from this WhatsApp conversation.
-Input JSON: {phone, existing_rows, conversation:[{id,ts,from,is_new,text}]}. from=BUSINESS is us; from=CUSTOMER is the customer. existing_rows is authoritative. is_new=false is context only; only is_new=true messages can justify a returned change.
-Return ONLY valid JSON, no prose, no markdown fences: {"phone":"...","records":[{"kind":"new|update","record_id":null,"order_anchor_id":null,"start_date":"YYYY-MM-DD","client_name":"","doc_type":"","language_pair":"","price":"","delivery_time":"","status":"confirmed_unpaid|paid|translating|revision|done|cancelled|refunded","summary":"","evidence_msg_ids":["id from is_new=true"]}]}
+Extract OBSERVATIONS about customer orders from this WhatsApp conversation.
 
-DELTA + IDENTITY CONTRACT (LOAD-BEARING):
-- Return ONLY records whose state changed because of is_new=true messages. Do not re-emit unchanged historical records.
-- COMMITMENT means a CUSTOMER message sent AFTER our concrete quote that instructs us to proceed ("yes please", "go ahead", "send the link"), promises/completes payment, or otherwise converts THAT quote into an order. NOT commitment: a quote with no customer reply after it; a polite acknowledgment ("ok", "alright", "thanks", "noted", "sure") that answers a DIFFERENT question or precedes the price; an unanswered inquiry with no quote; a declined negotiation ("too expensive", "I went elsewhere"). Eight phantom rows once shipped in a single run from exactly these shapes — when in doubt, DROP. A missed lead costs a follow-up; a phantom row costs the operator chasing money nobody committed.
-- NEW ORDER: kind="new", record_id=null, and order_anchor_id is the earliest is_new message proving commitment to that order. Include that id in evidence_msg_ids. A repeat request such as "same as last time" is still a NEW order.
-- EXISTING ORDER UPDATE: kind="update", record_id is the exact matching id from existing_rows, and order_anchor_id=null. Never make up or alter an existing id.
-- Never reuse a done/cancelled/refunded record_id for a later order. A later order in the same chat, including on the same calendar day, is kind="new".
-- If a new order starts, is paid, and is delivered entirely within this delta, it remains kind="new" with status="done".
-- Every evidence_msg_id must identify an is_new=true message. Old messages may explain context but cannot justify a write by themselves.
+Input JSON:
+  {phone, existing_rows, context:[{id,ts,from,text}], new_messages:[{id,ts,from,text}]}
+  from=BUSINESS is us; from=CUSTOMER is the customer.
+  existing_rows is AUTHORITATIVE — the orders we already know about.
+  context is older conversation for reading comprehension ONLY.
+  new_messages are the messages that arrived since we last looked. THEY ARE THE ONLY VALID EVIDENCE.
 
-STATUS = A PIPELINE STAGE (what the business must do next):
-- "confirmed_unpaid": customer committed but payment NOT received -> chase payment. Applies even if work was delivered early: unpaid is unpaid.
-- "paid": payment received, but the finished work has NOT yet been sent to the customer. This is the DEFAULT stage right after "Payment received".
-- "translating": work underway (we told the customer it is being worked on / in progress).
-- "revision": we delivered but the customer requested changes; fixes pending.
-- "done": paid AND we delivered the FINAL product for THAT order to the customer (see the DELIVERY rule below). A draft sent for the customer to check is NOT done. Nothing pending.
-- "cancelled": the order was called off after commitment and NOT refunded (either it was never paid, or it was paid and no money was returned). Signals: the CUSTOMER asks to cancel / "cancel it" / "I don't need it anymore" / "changed my mind", OR WE tell them it is cancelled. TERMINAL — no further work.
-- "refunded": the order was called off AND we returned the customer's money. Signals: WE say "refund" / "refunded" / "cancel and refund", OR we send a refund receipt/screenshot after a cancellation. Prefer "refunded" over "cancelled" whenever a refund is mentioned or shown. TERMINAL.
-- CANCELLED/REFUNDED ARE TERMINAL AND STICKY. Do not return an unchanged terminal row. A clearly later order is kind="new", even when it starts on the same date.
+Return ONLY valid JSON, no prose, no markdown fences:
+{"phone":"...","records":[{
+  "kind":"new|update",
+  "record_id": null,
+  "order_anchor_id": null,
+  "start_date":"YYYY-MM-DD",
+  "client_name":"","doc_type":"","language_pair":"","price":"","delivery_time":"","summary":"",
+  "observations":[{"type":"payment_received","evidence_msg_ids":["id from new_messages"]}]
+}]}
 
-EVIDENCE BINDING — a long chat holds MANY separate orders from the SAME customer. Do not mix them up:
-- Each order owns only the messages from its own quote/commitment up to the next order's quote. A file WE delivered BEFORE a later order was even quoted belongs to the EARLIER order — never to the later one. Same calendar day proves nothing.
-- To return "done" you must be able to point at US (BUSINESS) sending the finished work AFTER that specific order's payment. If the newest order was paid and nothing has been delivered since that payment, it is "paid" — NOT "done".
-- Customer words are not stages. A customer typing "Done" / "done" / "ok done" almost always means THEY finished the PAYMENT, not that the order is complete. "Payment received" (from us) => "paid", never "done".
+YOU DO NOT DECIDE THE ORDER'S STATUS. Never output a "status" field — it is rejected.
+You report WHAT YOU OBSERVED, each tied to specific new messages, and the system derives the
+stage. Your job is the part only a reader can do: which real order does this belong to, did
+the customer actually commit, is this image a receipt or the source document, is this a draft
+or the final, is the evidence too ambiguous to act on.
 
-DELIVERY — a DRAFT is not delivery; only the final product completes an order:
-- Our workflow has TWO business file-sends: (1) a DRAFT for the customer to review, then (2) the FINAL certified/stamped file after they approve. "done" needs step 2, not step 1.
-- DRAFT signals (order stays "translating", NEVER "done", even if the customer says "perfect"): we send a file WITH wording like "before we stamp", "before stamping", "check the draft", "any comments/changes before", "please have a look" — or we send an editable working file for review. The customer's approval of a draft ("perfect", "confirmed", "looks good") is approval to FINALISE, not receipt of the finished product.
-- DELIVERY signals ("done"): AFTER any draft step, we send the FINAL file — typically the certified PDF — usually with "Done"/"All done" and/or a review-request link. We only ask for a review AFTER delivering the final product, so a review link is a strong delivery signal.
-- If the newest business file-send for a paid order carries a "before we stamp" caveat and NO later final has been sent, the order is "translating" — never "done". When it is genuinely unclear whether the final was sent, prefer "translating" over "done": a not-yet-done order costs a follow-up; a falsely-done order means we stop chasing an unfinished job.
-- PAYMENT PROOF is usually a CUSTOMER action, not our words — we do NOT always type "Payment received". After WE send a payment link, if the CUSTOMER then sends an IMAGE/screenshot, OR says "done"/"paid"/"sent"/"transferred"/"here you go", AND does not report trouble paying, treat that as PAYMENT RECEIVED => status at least "paid". A customer image right after our payment link is a payment receipt. BUT an image the customer sent BEFORE we sent the payment link is the DOCUMENT to work on, not a receipt — never count that as payment. Only a customer image/confirmation that comes AFTER our payment link is payment proof.
-- Never invent an outsourcing status. WHO does the work is not a stage; a separate pass owns the "counterparty" column. Only ever return one of the seven statuses above.
+THE OBSERVATION VOCABULARY — these are the only valid "type" values:
+- "order_committed"    the customer COMMITTED to a quoted order (see COMMITMENT below).
+- "payment_received"   payment for that order evidently landed (see PAYMENT PROOF below).
+- "work_started"       we told the customer their work is underway / in progress.
+- "draft_sent"         we sent a DRAFT for the customer to review (NOT the finished product).
+- "final_delivered"    we sent the FINAL completed work for THAT order, AFTER its payment.
+- "revision_requested" we delivered and the customer asked for changes.
+- "order_cancelled"    the committed order was called off and no money was returned.
+- "payment_refunded"   we returned the customer's money. Prefer this over order_cancelled
+                       whenever a refund is mentioned or shown.
+
+Emit EVERY observation the new messages justify, each with its own evidence. If an order was
+committed, paid and delivered all within these new messages, emit all three — the system
+walks the whole lifecycle in one pass.
+
+IDENTITY CONTRACT (LOAD-BEARING):
+- Report ONLY orders that new_messages say something about. Do not re-report unchanged orders.
+- NEW ORDER: kind="new", record_id=null, and order_anchor_id is the earliest new message
+  proving commitment. That id must also appear in the evidence of one of your observations.
+- EXISTING ORDER: kind="update", record_id is the exact matching id from existing_rows, and
+  order_anchor_id=null. Never invent or alter an existing id.
+- A later order is ALWAYS kind="new" — including from the same customer, in the same chat, on
+  the same calendar day, or when an earlier order is already finished, cancelled or refunded.
+  A repeat request such as "same as last time" is a NEW order.
+- Every evidence_msg_id MUST come from new_messages. An id from context is forbidden as
+  evidence: we already processed those messages, and citing them re-litigates settled orders.
+
+COMMITMENT — what makes an order real:
+- A CUSTOMER message sent AFTER our concrete quote that instructs us to proceed ("yes please",
+  "go ahead", "send the link"), promises or completes payment, or otherwise converts THAT
+  quote into an order.
+- NOT commitment: a quote with no customer reply after it; a polite acknowledgment ("ok",
+  "alright", "thanks", "noted", "sure") that answers a DIFFERENT question or precedes the
+  price; an unanswered inquiry with no quote; a declined negotiation ("too expensive", "I went
+  elsewhere"). Eight phantom orders once shipped in a single run from exactly these shapes.
+- When in doubt, report NOTHING. A missed lead costs a follow-up; a phantom order costs the
+  operator chasing money nobody ever committed.
+
+EVIDENCE BINDING — a long chat holds MANY separate orders from the SAME customer:
+- Each order owns only the messages from its own quote/commitment up to the next order's
+  quote. A file WE delivered BEFORE a later order was even quoted belongs to the EARLIER
+  order — never to the later one. Same calendar day proves nothing.
+- "final_delivered" requires pointing at US (BUSINESS) sending the finished work AFTER that
+  specific order's payment. If the newest order was paid and nothing has been sent since that
+  payment, do NOT emit final_delivered.
+- Customer words are not observations about our work. A customer typing "Done" / "done" /
+  "ok done" almost always means THEY completed the PAYMENT — that is "payment_received",
+  never "final_delivered".
+
+DRAFT vs FINAL — the distinction that decides whether an order is finished:
+- Our workflow has TWO business file-sends: (1) a DRAFT for the customer to review, then
+  (2) the FINAL certified/stamped file after they approve.
+- DRAFT signals -> emit "draft_sent": we send a file WITH wording like "before we stamp",
+  "before stamping", "check the draft", "any comments/changes before", "please have a look",
+  or we send an editable working file for review. The customer approving a draft ("perfect",
+  "confirmed", "looks good") is approval to FINALISE — it is not receipt of the product, and
+  it is not itself an observation.
+- FINAL signals -> emit "final_delivered": AFTER any draft step, we send the final file —
+  typically the certified PDF — usually with "Done"/"All done" and/or a review-request link.
+  We only ask for a review AFTER delivering the final product, so a review link is a strong
+  delivery signal.
+- If the newest business file-send carries a "before we stamp" caveat and no later final has
+  been sent, emit draft_sent and NOT final_delivered. When genuinely unclear which one it was,
+  emit draft_sent: an unfinished order costs a follow-up, a falsely-finished one means we stop
+  chasing real work.
+
+PAYMENT PROOF is usually a CUSTOMER action, not our words — we do NOT always type "Payment
+received". After WE send a payment link, if the CUSTOMER then sends an IMAGE/screenshot, OR
+says "done"/"paid"/"sent"/"transferred"/"here you go", AND does not report trouble paying,
+emit "payment_received". A customer image right after our payment link is a receipt. BUT an
+image the customer sent BEFORE we sent the payment link is the DOCUMENT to work on, not a
+receipt — never treat that as payment. The ORDER of the link and the image is the whole rule.
 
 LANGUAGE DIRECTION (DOMAIN-SPECIFIC — delete this whole block if your domain has no such field):
-- We are a UAE legal-translation business. A document translated FOR a UAE authority — RTA, traffic department, courts, ministries, notary, municipality, immigration — goes INTO ARABIC. That is the default target, not English.
-- Driving licences are ~99% into Arabic. A foreign licence sent for licence-exchange or traffic purposes is "<Source> to Arabic" — NEVER "<Source> to English". The source document being German does NOT make English the target.
-- Purpose phrases implying an ARABIC target: "for RTA", "to exchange my licence", "for the traffic department", "for the court", "for the ministry", "for the notary".
-- Only record English as the target when it is explicit: a document going to an embassy, university, or authority ABROAD, or the customer asks for English by name.
-- If the target is genuinely unstated and the purpose is a local authority, use Arabic. If nothing indicates direction, leave language_pair EMPTY rather than guessing.
+- We are a UAE legal-translation business. A document translated FOR a UAE authority — RTA,
+  traffic department, courts, ministries, notary, municipality, immigration — goes INTO ARABIC.
+  That is the default target, not English.
+- Driving licences are ~99% into Arabic. A foreign licence sent for licence-exchange or traffic
+  purposes is "<Source> to Arabic", NEVER "<Source> to English". The source document being
+  German does not make English the target.
+- Purpose phrases implying an ARABIC target: "for RTA", "to exchange my licence", "for the
+  traffic department", "for the court", "for the ministry", "for the notary".
+- Record English as the target only when explicit: a document going to an embassy, university,
+  or authority ABROAD, or the customer asks for English by name.
+- If direction is genuinely unstated, leave language_pair EMPTY rather than guessing.
 - Format as "<Source> to <Target>" — e.g. "German to Arabic", "English to Arabic".
 
-Rules: one object per AFFECTED COMMITTED order only. DROP entirely (no row): bare quotes with no commitment, greetings, idle inquiries, marketing (a mere price ask the customer never committed to is not an order). But an order that WAS committed and then cancelled/refunded is NOT dropped when new messages create that terminal transition — return an update with status "cancelled" or "refunded". Multiple files under one quote = ONE order (list them in doc_type). For a new order, start_date = date of that order's first message. price = agreed total (e.g. "AED 280"). status = LATEST stage reached. If a matching existing_row already has paid_at set, never return "confirmed_unpaid" for it. If no is_new message changes a committed order: {"phone":"...","records":[]}. That is the CORRECT answer most ticks.
+FIELDS: multiple files under one quote = ONE order (list them in doc_type). For a new order,
+start_date = the date of that order's first message. price = the agreed total (e.g. "AED 280").
+Never put a phone number in client_name.
+
+If new_messages justify no observation about any committed order, return
+{"phone":"...","records":[]}. That is the CORRECT answer most ticks.

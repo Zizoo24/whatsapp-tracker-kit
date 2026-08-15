@@ -16,17 +16,17 @@ SyntaxError'd the whole watcher for three silent ticks.
 | Block | Class | Why |
 |---|---|---|
 | Input/output JSON schema | **STRUCTURAL** | Must match `scripts/lib/client-result.cjs` exactly. Change both together or every result is rejected. |
-| DELTA + IDENTITY CONTRACT | **STRUCTURAL** | The `kind: new/update` + `order_anchor_id` split is what makes ids stable and repeat customers safe. |
-| "COMMITMENT means…" definition | **STRUCTURAL shape, DOMAIN examples** | Keep "an affirmative reply AFTER a concrete quote"; swap the example phrasings for your customers' idioms. **Keep the negative list** — the "polite acknowledgment" trap shipped 8 phantom rows in one run. |
-| Never reuse a terminal id | **STRUCTURAL** | Enforced in code too. The prompt must agree or every later order is rejected. |
-| Status list + meanings | **DOMAIN names, STRUCTURAL shape** | Rename freely. Keep: two poles + middles, terminal-dead states representable (never deleted), and the "unpaid is unpaid even if delivered early" rule. |
+| "YOU DO NOT DECIDE THE STATUS" | **STRUCTURAL — the central boundary** | The model emits **observations**; code derives state. Enforced by validation, which rejects any record carrying a `status`. This is what makes the "Done" and draft traps structurally impossible rather than prompt-discouraged. |
+| THE OBSERVATION VOCABULARY | **DOMAIN names, STRUCTURAL shape** | Rename to your events, but keep every entry a concrete, checkable occurrence — never a state. Must match `OBSERVATION_STAGE` in `status-model.cjs` exactly. |
+| IDENTITY CONTRACT | **STRUCTURAL** | The `kind: new/update` + `order_anchor_id` split is what makes ids stable and repeat customers safe. |
+| "COMMITMENT" definition | **STRUCTURAL shape, DOMAIN examples** | Keep "an affirmative reply AFTER a concrete quote"; swap phrasings for your customers' idioms. **Keep the negative list** — the "polite acknowledgment" trap shipped 8 phantom rows in one run. |
+| Never reuse a terminal id | **STRUCTURAL** | Enforced in code too. The prompt must agree, or every later order gets rejected. |
 | EVIDENCE BINDING | **STRUCTURAL — the single most valuable block** | One chat holds many records from one customer. "A file delivered BEFORE a later order was quoted belongs to the EARLIER order; same calendar day proves nothing." Without it the model attributes work to the wrong record. |
-| "Customer words are not stages" | **STRUCTURAL** | A customer typing "Done" means *they paid*. Read as the terminal stage, it marked a brand-new unpaid order complete on arrival. |
-| DRAFT vs FINAL delivery | **STRUCTURAL shape, DOMAIN signals** | Nearly every business has a two-send workflow (draft → final, quote → invoice, staging → live). Keep "the intermediate artifact is NOT completion" and the tie-break: **when unclear, prefer the earlier stage.** An unfinished record costs a follow-up; a falsely-complete one means you stop chasing it. |
-| PAYMENT PROOF / screenshot rule | **STRUCTURAL** | Where a payment method has no read API, customers prove payment with a screenshot. The ordering test is the whole rule: an image **after** our payment link is a receipt; **before** it, it is the work item. Without this, paid records sit unpaid and you chase money you already have. |
-| "Never invent an outsourcing status" | **STRUCTURAL** | Enforces the status-vs-column split. If the model returns an off-model status, validation drops the record — silently losing it. |
+| "Customer words are not observations about our work" | **STRUCTURAL** | A customer typing "Done" means *they paid* → `payment_received`, never `final_delivered`. |
+| DRAFT vs FINAL | **STRUCTURAL shape, DOMAIN signals** | Nearly every business has a two-send workflow (draft → final, quote → invoice, staging → live). Keep the tie-break: **when unclear, emit the earlier observation.** An unfinished record costs a follow-up; a falsely-complete one means you stop chasing real work. |
+| PAYMENT PROOF / screenshot rule | **STRUCTURAL** | Where a payment method has no read API, customers prove payment with a screenshot. The ordering test is the whole rule: an image **after** our payment link is a receipt; **before** it, it is the work item. |
 | LANGUAGE DIRECTION | **DOMAIN — delete it** | Wholly specific to bilingual translation. Replace with your own "field the model reliably gets wrong" block, or remove. |
-| Final "Rules:" paragraph | **STRUCTURAL shape, DOMAIN specifics** | Keep "drop non-commitments", "multiple items under one quote = ONE record", and the empty-result instruction. Swap the price format. |
+| FIELDS paragraph | **STRUCTURAL shape, DOMAIN specifics** | Keep "multiple items under one quote = ONE record" and the empty-result instruction. Swap the price format. |
 
 ## `counterparty-rules.txt`
 
@@ -49,6 +49,9 @@ SyntaxError'd the whole watcher for three silent ticks.
    Do **not** run `tracker-prep.cjs` to test — it wipes a live tick's work directory.
 3. Verify the output still passes `validateAndNormalizeClientResult`. A prompt change that
    drifts from the schema turns every tick into a deferral, which looks like an outage.
-4. Keep `prompts/` and `scripts/lib/status-model.cjs` in sync. If the prompt can emit a
-   status the model file doesn't know, `VALID_STATUS` drops the record **silently** — the
-   worst failure shape in the system.
+4. Keep `prompts/` and `scripts/lib/status-model.cjs` in sync. **Every observation type the
+   prompt can emit must exist in `OBSERVATION_STAGE`**, or validation rejects the whole
+   chat's result. That rejection is loud and deferred — which is the intended behaviour, but
+   it looks like an outage if you shipped the mismatch.
+5. Never re-introduce a `status` field to the prompt. Validation rejects it on purpose; the
+   reducer owns state.

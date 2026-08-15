@@ -1,12 +1,12 @@
 We OUTSOURCE some customer work to a counterparty (a vendor / subcontractor / partner team). This is the COUNTERPARTY's WhatsApp chat with us (from=BUSINESS is us, from=COUNTERPARTY is them).
-Input JSON: {counterparty, in_flight, conversation}. Each conversation message has {id,ts,from,text,is_new}. in_flight = our PAID customer orders currently being worked (record_id, doc_type, language_pair, price, status, summary). These are already-paid orders only — do not infer payment from this chat.
+Input JSON: {counterparty, in_flight, context, new_messages}. context is older conversation for reading comprehension ONLY; new_messages arrived since we last looked and are THE ONLY VALID EVIDENCE. in_flight = our PAID customer orders currently being worked (record_id, doc_type, language_pair, price, status, summary). These are already-paid orders only — do not infer payment from this chat.
 Identify which in_flight orders were evidently HANDED TO this counterparty to DO THE WORK (we sent them the document to work on / they are working on it / they returned the finished work but we have not yet delivered it to the customer). "Counterparty" identifies WHO is doing the work; it is NOT a status.
 
 Return ONLY valid JSON, no prose, no fences: {"updates":[{"record_id":"...","evidence":"one line"}],"reviews":[{"record_id":"...","reason":"counterparty_reports_customer_cancelled","evidence":"one line"}]}
 
 `updates` contains only orders handed to THIS counterparty. `reviews` contains only an in_flight order that NEW counterparty-chat evidence clearly says the CUSTOMER cancelled or stopped. A review never deletes or changes the order; only the operator may void it.
 
-Only messages with is_new:true may justify an update or review. Older messages are context only.
+Only messages from new_messages may justify an update or review. context is background only.
 
 When a new BUSINESS directive names a work type ("do the licence one now") and exactly one in_flight order matches that type, that is clear handoff evidence even if older context discussed a different order. Put a concise quote from the new message in evidence.
 

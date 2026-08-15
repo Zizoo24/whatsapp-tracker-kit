@@ -56,7 +56,9 @@ async function post(cfg, body, label) {
 // leave it false for normal writes so an empty field never erases a populated cell.
 export async function appendRows(rows, cfg, sheetName = 'Records', { replaceEmpty = false } = {}) {
   if (!rows.length) return { appended: 0, updated: 0 };
-  return post(cfg, { sheet: sheetName, rows, replaceEmpty }, 'Store write');
+  // `action` is explicit: the hardened endpoint rejects a request whose intent it would
+  // otherwise have to guess.
+  return post(cfg, { action: 'upsert', sheet: sheetName, rows, replaceEmpty }, 'Store write');
 }
 
 export async function fetchRows(cfg, sheetName = 'Records') {

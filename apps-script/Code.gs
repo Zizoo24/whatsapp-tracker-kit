@@ -413,10 +413,24 @@ function doPost(e) {
     return out({ ok: true });
   }
 
-  var name = SHEETS[body.sheet] ? body.sheet : 'Records';
+  // HARDENING: never guess the caller's intent.
+  //
+  // v1 defaulted an unknown tab name to 'Records' and let a MISSING action fall through into
+  // the upsert path. Both are silent-wrong-target hazards: a typo'd tab wrote customer rows
+  // into the wrong sheet, and a malformed request became a write. Require both explicitly
+  // and reject anything unrecognised.
+  if (body.sheet !== undefined && !SHEETS[body.sheet]) {
+    return out({ ok: false, error: 'unknown sheet: ' + body.sheet });
+  }
+  var name = body.sheet || 'Records';
+
+  var action = body.action || (body.rows ? 'upsert' : '');
+  if (['upsert', 'read', 'delete'].indexOf(action) === -1) {
+    return out({ ok: false, error: 'unknown or missing action: ' + (action || '(none)') });
+  }
 
   // READ path — no lock, no schema mutation. A read must not block writes or alter columns.
-  if (body.action === 'read') {
+  if (action === 'read') {
     var rsh = tab_(name);
     var rdata = rsh.getLastRow() ? rsh.getDataRange().getValues() : [];
     var rheader = rdata[0] || [];
@@ -446,7 +460,7 @@ function doPost(e) {
       if (k) keyToRow[k] = i + 1;
     }
 
-    if (body.action === 'delete') {
+    if (action === 'delete') {
       var wanted = {};
       (body.keys || []).forEach(function (key) { wanted[String(key)] = true; });
       var rowsToDelete = [];
@@ -482,6 +496,16 @@ function doPost(e) {
         if (col[f] != null && (v || clearSet[f] || replaceEmpty)) target[col[f]] = v;
       });
     };
+
+    // Every automated write must carry the stable key. Without it a retry cannot be
+    // idempotent: the row is appended again instead of updated, and nothing can ever
+    // address it afterwards. (A human adding a row by hand in the UI is unaffected.)
+    var missingKey = (body.rows || []).filter(function (r) {
+      return !r || String(r[cfg.key] || '').trim() === '';
+    }).length;
+    if (missingKey) {
+      return out({ ok: false, error: missingKey + ' row(s) missing the required key: ' + cfg.key });
+    }
 
     (body.rows || []).forEach(function (r) {
       var k = r[cfg.key];

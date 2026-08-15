@@ -1,14 +1,13 @@
----
-name: tracker-operator
-description: Reconcile WhatsApp conversations with the tracker store as an evidence-led agent. Use for stale or missing updates, needs-attention row audits, correcting a record's status or counterparty, diagnosing ingestion freshness, handling repeat customers and multiple records in one chat, and safely applying evidence-backed corrections.
----
+# Tracker operator — the correction and audit reference
 
-# Tracker operator — the agent lane
+**This is a reference, not a separate agent.** Load it into whichever agent is already
+helping the operator when the task is a correction, an audit, a stale-tracker complaint, or
+post-outage recovery. There is no need for a permanent second agent: one lead agent plus the
+tracker skill covers setup, investigation, catch-up and repair.
 
-Operate the tracker as an **evidence-led agent**. You reason about record identity and
-lifecycle from the conversation; deterministic tooling does snapshot, validation, backup,
-write, and readback. You are the semantic authority for corrections, ambiguity, and deep
-audits — the automated lane is not.
+Operate as an **evidence-led** reader. You reason about record identity and lifecycle from
+the conversation; `scripts/tracker-admin.cjs` performs every write. You are the semantic
+authority for corrections, ambiguity, and deep audits — the automated lane is not.
 
 ---
 
@@ -136,15 +135,41 @@ makes old-timestamp messages restored after a sleep visible at all.
 
 ---
 
-## Tooling note
+## The tool
 
-This kit ships the **agent contract**, not the source system's bundled `tracker-tool.cjs`
-(which was coupled to its event ledger). Until you build an equivalent, drive corrections
-through the same deterministic pieces the automated lane uses — `src/sheet.js` for the
-read/upsert and `scripts/lib/client-result.cjs` for validation — and preserve the four
-properties that make a write safe:
+`scripts/tracker-admin.cjs`. It contains no classification logic and calls no model — you
+decide what is true, it performs the write safely.
 
-1. a **fresh snapshot** (reject anything older than ~60 minutes);
-2. a **re-read of live rows** that refuses any row changed since the snapshot;
-3. a **backup** before mutating;
-4. a **field-by-field readback** after writing, before reporting success.
+```bash
+# 1. Snapshot (add --phone DIGITS to scope to one customer)
+node scripts/tracker-admin.cjs snapshot --output /tmp/snap.json
+
+# 2. Write a proposal, then see the exact before/after
+node scripts/tracker-admin.cjs validate --snapshot /tmp/snap.json --proposal /tmp/prop.json
+node scripts/tracker-admin.cjs apply --snapshot /tmp/snap.json --proposal /tmp/prop.json --dry-run
+
+# 3. Apply (only after stopping the automated lane)
+node scripts/tracker-admin.cjs apply --snapshot /tmp/snap.json --proposal /tmp/prop.json \
+  --confirm APPROVED --agent claude
+
+# Inspect one record before and after
+node scripts/tracker-admin.cjs inspect --record RECORD_ID
+```
+
+Proposal shape — `note` is mandatory, and a JSON `null` clears a field:
+
+```json
+{ "corrections": [
+  { "record_id": "971500000000_2026-08-15#ab12cd34",
+    "fields": { "status": "done", "counterparty": null },
+    "note": "operator delivered this directly; confirmed in chat 2026-08-15" } ] }
+```
+
+The tool enforces the four properties that make an agent write safe: a **fresh snapshot**
+(>60 min is refused), an **optimistic concurrency check** (any row changed since the snapshot
+aborts), a **backup** of every affected row before mutating, and a **field-by-field readback**
+after writing. **Report success only when it returns `readback_verified: true`.**
+
+Note that an operator correction may move a record **backwards** — that is allowed here and
+forbidden to the automated lane, which is exactly why the transition guard lives at the
+writer and not in the store API.

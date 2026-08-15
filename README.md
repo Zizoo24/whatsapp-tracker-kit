@@ -4,9 +4,11 @@ Turn a live WhatsApp conversation stream into **one durable row per real busines
 — order, ticket, lead, booking — using exactly one LLM judgment step surrounded by
 deterministic code.
 
-> A message stream → a deterministic scan bounded by a **rowid cursor** → **one model call
-> per chat** → an idempotent **upsert keyed by a stable record id**, with SQLite as memory
-> and monotonic guards protecting hard-won state.
+> A message stream → a deterministic scan bounded by an **ingestion-order cursor** → **one
+> model call per changed conversation** → deterministic **validation + a lifecycle reducer**
+> → an idempotent **upsert keyed by a stable record id**.
+>
+> **The model reports observations. Code derives state.**
 
 This is the portable distillation of a system that ran in production for months. Its guards
 are not defensive-programming habits — **each one is an incident that reached real data**.
@@ -64,44 +66,46 @@ Full setup, including the store backend and the three seams you must adapt, is i
 | File | Read it when |
 |---|---|
 | **[SKILL.md](SKILL.md)** | **start here** — the agent front door, setup, diagnostics |
+| [docs/INGRESS.md](docs/INGRESS.md) | **before building anything** — bridge vs. official Coexistence |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | you want the five moving parts and the failure model |
-| [docs/GUARDS.md](docs/GUARDS.md) | **before changing anything** — 21 production incidents |
-| [docs/PORTING.md](docs/PORTING.md) | adapting to your domain; the deployment checklist |
+| [docs/GUARDS.md](docs/GUARDS.md) | **before changing anything** — 24 production incidents |
+| [docs/PORTING.md](docs/PORTING.md) | core invariants vs. business modules; the checklist |
 | [docs/LEDGER-ARCHITECTURE.md](docs/LEDGER-ARCHITECTURE.md) | you need replay, provenance, durable corrections |
 | [prompts/TEMPLATE-NOTES.md](prompts/TEMPLATE-NOTES.md) | editing prompts — what is structural vs domain |
 | [bridge/README.md](bridge/README.md) | building the bridge; the required `/api/health` patch |
-| [agents/tracker-operator.md](agents/tracker-operator.md) | the agent lane for corrections and audits |
+| [agents/tracker-operator.md](agents/tracker-operator.md) | corrections and audits (a reference, not a second agent) |
 
 ---
 
-## The three seams
+## What to change
 
-Everything else ports unchanged.
+**Core invariants port unchanged** — the cursor, the run lock, fail-closed validation,
+never truncating new evidence, the guarded writer, transport-only keepalive.
 
-| Seam | File | What you change |
-|---|---|---|
-| 1. Extraction contract | `prompts/*.txt` | what the model looks for |
-| 2. Lifecycle model | `scripts/lib/status-model.cjs` | your stages and their rank |
-| 3. Store schema | `apps-script/Code.gs` → `SHEETS` | your columns |
-
-Change all three **together** — they must agree, or records are silently dropped.
+**Business modules you adapt or delete:** the prompts, the lifecycle model, the store
+schema, counterparties, payments, attribution. Change the first three **together** — they
+must agree or records are dropped. See [docs/PORTING.md](docs/PORTING.md).
 
 ---
 
-## Five things that will bite you
+## Six things that will bite you
 
-1. **Never revert the cursor to a timestamp.** rowid order ≠ timestamp order (20 inversions
-   per 4,000 messages, worst ~6 days late). A timestamp watermark makes late-arriving
-   messages **unreachable forever**.
-2. **Always open the live SQLite `{readOnly: true, timeout: 5000}`.** Without a *finite*
+1. **Never revert the cursor to a timestamp.** Ingestion order ≠ timestamp order (20
+   inversions per 4,000 messages, worst ~6 days late). A timestamp watermark makes
+   late-arriving messages **unreachable forever**.
+2. **Never truncate new evidence.** A context cap that trims a merged, timestamp-sorted
+   array will silently drop a newly ingested old-timestamp message while the cursor advances
+   past it — defeating the cursor with a performance optimisation (GUARDS #23).
+3. **Authoritative reads fail closed.** The lid map, the store read, and the writer's
+   pre-read all abort rather than continue; each fail-open turns a transient error into
+   permanent corruption (GUARDS #24).
+4. **Always open the live SQLite `{readOnly: true, timeout: 5000}`.** Without a *finite*
    timeout, `node:sqlite` hangs on the bridge's live writes and the lane wedges.
-3. **Chats are keyed by `@lid`, not phone.** Query only the phone JID and an active chat is
-   invisible — no error, just no data.
-4. **Use a long-lived model token.** A normal login token expires ~daily and a headless
+5. **Use a long-lived model token.** A normal login token expires ~daily and a headless
    subprocess cannot refresh it: silent 401s, frozen cursor, everything *looks* healthy.
    (A stray leading space in the token file also 401s.)
-5. **The monotonic guard belongs at the writer, never the store API** — the API is also the
-   correction path.
+6. **The transition guard belongs at the writer, never the store API** — the API is also the
+   correction path, and an operator must be able to move a record backwards.
 
 ---
 

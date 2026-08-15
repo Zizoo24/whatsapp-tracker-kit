@@ -2,12 +2,22 @@
 'use strict';
 // tracker-prep.cjs — DETERMINISTIC INPUT ASSEMBLY. No model call happens here.
 //
-// Finds chats with newly INGESTED messages (rowid delta, not timestamp) and writes one
-// JSON file per chat containing the conversation plus that counterparty's existing store
-// rows, so the model can reconcile against authoritative state instead of guessing.
+// Finds chats with newly INGESTED messages (rowid delta, not timestamp) and writes one JSON
+// file per chat containing:
+//   new_messages : EVERY message in the rowid delta. Never truncated. The only valid evidence.
+//   context      : older messages, capped. Reading comprehension only.
+//
+// THAT SPLIT IS LOAD-BEARING (docs/GUARDS.md #23). v1 emitted one `conversation` array
+// sorted by (timestamp, rowid) and let the watcher keep only the newest N entries. A message
+// can be newly INGESTED with an OLD send timestamp — that is the entire reason the cursor is
+// a rowid — so it sorted toward the front, got truncated away, and the cursor still advanced
+// past its rowid. That silently violates the cardinal rule: never advance a cursor over a
+// message the model was not shown.
+//
+// If a chat's new-message delta exceeds the budget we LOWER THE INGESTION BOUNDARY for the
+// whole pass rather than dropping evidence. The remainder is picked up next tick.
 //
 // Usage: node scripts/tracker-prep.cjs
-//
 // DO NOT RUN THIS WHILE A TICK IS LIVE — it wipes the work directory.
 
 const { DatabaseSync } = require('node:sqlite');
@@ -26,16 +36,29 @@ const ROOT = path.join(__dirname, '..');
 const STATE = path.join(ROOT, 'tracker-state.json');
 const WORKDIR = path.join(ROOT, '.tracker-work');
 
+// Budget for NEW messages per chat. Exceeding it lowers the boundary; it never truncates.
+const MAX_NEW = Number(process.env.TRACKER_MAX_NEW_MSGS || 150);
+// Cap for historical CONTEXT, which is safe to truncate — it can never justify a write.
+const MAX_CONTEXT = Number(process.env.TRACKER_MAX_CONTEXT_MSGS || 150);
+
 const canon = (s) => String(s || '').replace(/\D/g, '');
+const fail = (msg) => { console.error('prep ABORT: ' + msg); process.exit(1); };
+
+const toRow = (m, from, isNew) => ({
+  id: m.id,
+  ts: String(m.timestamp).slice(0, 16),
+  from,
+  is_new: isNew,
+  text: m.content || (m.media_type ? '[' + m.media_type + (m.filename ? ': ' + m.filename : '') + ']' : ''),
+});
 
 (async () => {
   const { loadConfig } = await import('file://' + path.join(ROOT, 'config.js').replace(/\\/g, '/'));
   const { fetchRows } = await import('file://' + path.join(ROOT, 'src', 'sheet.js').replace(/\\/g, '/'));
   const cfg = loadConfig();
-  if (!cfg.dbPath) throw new Error('WHATSAPP_DB_PATH is not set (see .env)');
+  if (!cfg.dbPath) fail('WHATSAPP_DB_PATH is not set (see .env)');
 
   const MSG_DB = cfg.dbPath;
-  // The lid->phone map lives in a sibling DB written by the same bridge.
   const WA_DB = MSG_DB.replace(/messages\.db$/i, 'whatsapp.db');
 
   // ALWAYS readOnly WITH a finite timeout. Without a finite timeout, node:sqlite HANGS
@@ -43,11 +66,13 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
   const M = new DatabaseSync(MSG_DB, { readOnly: true, timeout: 5000 });
   const st = readCursorState(STATE);
   const boundary = createMessageBoundary(M, st);
-  const { mode: cursorMode, sinceRowid, sinceTs, maxRowid } = boundary;
+  const { mode: cursorMode, sinceRowid, sinceTs } = boundary;
 
-  // MODERN WHATSAPP KEYS CHATS BY @lid, NOT BY PHONE. Without this map a phone number
-  // resolves to nothing and the chat is invisible. Both rails must be queried together,
-  // because one contact's history can span both.
+  // ---- lid map: FAIL CLOSED (GUARDS #24) ----------------------------------------------
+  // Modern WhatsApp keys chats by '<lid>@lid', not '<phone>@s.whatsapp.net'. Without this
+  // map a chat resolves to no phone and vanishes from the manifest — and then the global
+  // cursor advances past its messages anyway. v1 logged the failure and continued, which
+  // turned a transient read error into permanent, silent data loss.
   const lidToPn = new Map();
   const pnToLids = new Map();
   try {
@@ -59,7 +84,10 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
       if (!pnToLids.has(pn)) pnToLids.set(pn, []);
       pnToLids.get(pn).push(lid);
     }
-  } catch (e) { console.error('lid map unavailable:', e.message); }
+  } catch (e) {
+    fail('lid map unavailable (' + e.message + ') — refusing to run, because @lid chats '
+      + 'would silently disappear while the cursor advanced past them');
+  }
 
   const jidToPhone = (jid) => {
     if (jid.endsWith('@s.whatsapp.net')) return canon(jid.split('@')[0]);
@@ -67,99 +95,167 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
     return '';
   };
 
-  // Freeze this pass at maxRowid. Messages inserted while the model reasons stay ABOVE the
-  // boundary and are picked up next pass rather than being skipped.
-  const active = cursorMode === 'rowid'
-    ? M.prepare(
-      "SELECT chat_jid, MAX(rowid) hi FROM messages " +
-      "WHERE (chat_jid LIKE '%@s.whatsapp.net' OR chat_jid LIKE '%@lid') " +
-      'AND rowid > ? AND rowid <= ? GROUP BY chat_jid'
-    ).all(sinceRowid, maxRowid)
-    : M.prepare(
-      "SELECT chat_jid, MAX(timestamp) hi FROM messages " +
-      "WHERE (chat_jid LIKE '%@s.whatsapp.net' OR chat_jid LIKE '%@lid') " +
-      'AND timestamp > ? AND rowid <= ? GROUP BY chat_jid'
-    ).all(sinceTs, maxRowid);
-
-  const phones = new Set();
-  const activeCounterparties = new Set();
-  for (const a of active) {
-    const ph = jidToPhone(a.chat_jid);
-    if (!ph) continue;
-    if (COUNTERPARTIES[ph]) activeCounterparties.add(ph);
-    else phones.add(ph);
+  // ---- store read: FAIL CLOSED (GUARDS #24) -------------------------------------------
+  // Existing rows are AUTHORITATIVE. Continuing with an empty set makes every established
+  // record look brand new, so the model re-creates records that already exist.
+  let storeRows;
+  try {
+    storeRows = await fetchRows(cfg, 'Records');
+  } catch (e) {
+    fail('store read failed (' + e.message + ') — refusing to run, because existing records '
+      + 'would look new and be duplicated');
   }
-
-  // Registered counterparty GROUPS, queried separately: the scan above deliberately
-  // excludes '@g.us' because group traffic is not customer traffic. Only REGISTERED
-  // groups are pulled in — never groups at large.
-  const activeGroups = new Set();
-  const groupJids = Object.keys(COUNTERPARTY_GROUPS);
-  if (groupJids.length) {
-    const gph = '(' + groupJids.map(() => '?').join(',') + ')';
-    const rows = cursorMode === 'rowid'
-      ? M.prepare('SELECT chat_jid FROM messages WHERE chat_jid IN ' + gph +
-          ' AND rowid > ? AND rowid <= ? GROUP BY chat_jid').all(...groupJids, sinceRowid, maxRowid)
-      : M.prepare('SELECT chat_jid FROM messages WHERE chat_jid IN ' + gph +
-          ' AND timestamp > ? AND rowid <= ? GROUP BY chat_jid').all(...groupJids, sinceTs, maxRowid);
-    for (const g of rows) activeGroups.add(g.chat_jid);
-  }
-
-  // Read the store ONCE and group by phone, so the model reconciles against authoritative
-  // state rather than re-deriving history from messages alone.
-  let storeRows = [];
-  try { storeRows = await fetchRows(cfg, 'Records'); }
-  catch (e) { console.error('store read failed:', e.message); }
   const rowsByPhone = {};
   for (const r of storeRows) {
     const ph = canon(r.phone);
     if (ph) (rowsByPhone[ph] = rowsByPhone[ph] || []).push(r);
   }
 
+  // ---- Choose the ingestion boundary --------------------------------------------------
+  // Start at the frozen maximum, then LOWER it until no chat's new-message delta exceeds
+  // the budget. Lowering only ever shrinks every chat's delta, so this terminates.
+  const activeSql = cursorMode === 'rowid'
+    ? "SELECT chat_jid FROM messages WHERE (chat_jid LIKE '%@s.whatsapp.net' OR chat_jid LIKE '%@lid') "
+      + 'AND rowid > ? AND rowid <= ? GROUP BY chat_jid'
+    : "SELECT chat_jid FROM messages WHERE (chat_jid LIKE '%@s.whatsapp.net' OR chat_jid LIKE '%@lid') "
+      + 'AND timestamp > ? AND rowid <= ? GROUP BY chat_jid';
+
+  const newRowidsForJids = (jids, ceiling) => {
+    const ph = '(' + jids.map(() => '?').join(',') + ')';
+    return cursorMode === 'rowid'
+      ? M.prepare('SELECT rowid FROM messages WHERE chat_jid IN ' + ph
+          + ' AND rowid > ? AND rowid <= ? ORDER BY rowid').all(...jids, sinceRowid, ceiling)
+      : M.prepare('SELECT rowid FROM messages WHERE chat_jid IN ' + ph
+          + ' AND timestamp > ? AND rowid <= ? ORDER BY rowid').all(...jids, sinceTs, ceiling);
+  };
+
+  const jidsForPhone = (phone) => [
+    phone + '@s.whatsapp.net',
+    ...(pnToLids.get(phone) || []).map((l) => l + '@lid'),
+  ];
+
+  let ceiling = boundary.maxRowid;
+  let chunked = false;
+  for (let pass = 0; pass < 12; pass++) {
+    const active = cursorMode === 'rowid'
+      ? M.prepare(activeSql).all(sinceRowid, ceiling)
+      : M.prepare(activeSql).all(sinceTs, ceiling);
+
+    const groups = new Map();
+    for (const a of active) {
+      const phone = jidToPhone(a.chat_jid);
+      // An unresolvable jid must not be silently skipped — that is the failure the lid-map
+      // fail-closed above exists to prevent, arriving by another route.
+      if (!phone) {
+        fail('chat ' + a.chat_jid + ' has new messages but no resolvable phone — refusing to '
+          + 'advance the cursor past a conversation the model cannot be shown');
+      }
+      if (!groups.has(phone)) groups.set(phone, jidsForPhone(phone));
+    }
+    for (const jid of Object.keys(COUNTERPARTY_GROUPS)) {
+      const rows = cursorMode === 'rowid'
+        ? M.prepare('SELECT 1 FROM messages WHERE chat_jid = ? AND rowid > ? AND rowid <= ? LIMIT 1')
+          .all(jid, sinceRowid, ceiling)
+        : M.prepare('SELECT 1 FROM messages WHERE chat_jid = ? AND timestamp > ? AND rowid <= ? LIMIT 1')
+          .all(jid, sinceTs, ceiling);
+      if (rows.length) groups.set('group:' + jid, [jid]);
+    }
+
+    let lowered = null;
+    for (const jids of groups.values()) {
+      const rowids = newRowidsForJids(jids, ceiling);
+      if (rowids.length > MAX_NEW) {
+        // Cut at the budget-th new message. Everything above it waits for the next tick.
+        const cut = Number(rowids[MAX_NEW - 1].rowid);
+        lowered = lowered == null ? cut : Math.min(lowered, cut);
+      }
+    }
+    if (lowered == null) break;
+    ceiling = lowered;
+    chunked = true;
+  }
+
+  if (chunked) {
+    console.log('prep: ingestion boundary CHUNKED to rowid ' + ceiling
+      + ' (a chat exceeded ' + MAX_NEW + ' new messages; the remainder follows next tick)');
+  }
+
+  const isNew = (m) => isMessageNew(m, { ...boundary, maxRowid: ceiling });
+
+  // ---- Assemble per-chat inputs -------------------------------------------------------
   fs.rmSync(WORKDIR, { recursive: true, force: true });
   fs.mkdirSync(WORKDIR, { recursive: true });
+
+  const activeChats = cursorMode === 'rowid'
+    ? M.prepare(activeSql).all(sinceRowid, ceiling)
+    : M.prepare(activeSql).all(sinceTs, ceiling);
+
+  const phones = new Set();
+  const activeCounterparties = new Set();
+  for (const a of activeChats) {
+    const ph = jidToPhone(a.chat_jid);
+    if (!ph) continue; // already fail-closed above
+    if (COUNTERPARTIES[ph]) activeCounterparties.add(ph);
+    else phones.add(ph);
+  }
+  const activeGroups = new Set();
+  for (const jid of Object.keys(COUNTERPARTY_GROUPS)) {
+    const rows = cursorMode === 'rowid'
+      ? M.prepare('SELECT 1 FROM messages WHERE chat_jid = ? AND rowid > ? AND rowid <= ? LIMIT 1')
+        .all(jid, sinceRowid, ceiling)
+      : M.prepare('SELECT 1 FROM messages WHERE chat_jid = ? AND timestamp > ? AND rowid <= ? LIMIT 1')
+        .all(jid, sinceTs, ceiling);
+    if (rows.length) activeGroups.add(jid);
+  }
 
   const manifest = [];
   let maxTs = st.lastTs || sinceTs;
 
   for (const phone of phones) {
-    // Both rails for this phone, so the model sees the FULL history of the relationship
-    // even though only the new tail can justify a write.
-    const jids = [phone + '@s.whatsapp.net', ...(pnToLids.get(phone) || []).map((l) => l + '@lid')];
+    const jids = jidsForPhone(phone);
     const ph = '(' + jids.map(() => '?').join(',') + ')';
     const msgs = M.prepare(
-      'SELECT rowid,id,timestamp,is_from_me,media_type,filename,content FROM messages ' +
-      'WHERE chat_jid IN ' + ph + ' AND rowid <= ? ORDER BY timestamp,rowid'
-    ).all(...jids, maxRowid);
+      'SELECT rowid,id,timestamp,is_from_me,media_type,filename,content FROM messages '
+      + 'WHERE chat_jid IN ' + ph + ' AND rowid <= ? ORDER BY timestamp,rowid'
+    ).all(...jids, ceiling);
     if (!msgs.length) continue;
 
-    for (const m of msgs) if (isMessageNew(m, boundary)) maxTs = latestTimestamp(maxTs, m.timestamp);
+    // EVERY new message survives. Only context is capped.
+    const newMessages = [];
+    const context = [];
+    for (const m of msgs) {
+      if (isNew(m)) {
+        newMessages.push(toRow(m, m.is_from_me ? 'BUSINESS' : 'CUSTOMER', true));
+        maxTs = latestTimestamp(maxTs, m.timestamp);
+      } else {
+        context.push(toRow(m, m.is_from_me ? 'BUSINESS' : 'CUSTOMER', false));
+      }
+    }
+    if (!newMessages.length) continue;
+    const trimmedContext = context.slice(-MAX_CONTEXT);
 
-    const conversation = msgs.map((m) => ({
-      id: m.id,
-      ts: String(m.timestamp).slice(0, 16),
-      from: m.is_from_me ? 'BUSINESS' : 'CUSTOMER',
-      // is_new is the EVIDENCE GATE. Validation refuses any cited id that is not is_new,
-      // so old context can inform reading but can never justify a write.
-      is_new: isMessageNew(m, boundary),
-      text: m.content || (m.media_type ? '[' + m.media_type + (m.filename ? ': ' + m.filename : '') + ']' : ''),
-    }));
     const existing_rows = (rowsByPhone[phone] || []).map((r) => ({
       record_id: r.record_id, source_date: String(r.source_date).slice(0, 10), doc_type: r.doc_type,
       price: r.price, status: r.status, paid_at: r.paid_at || '', client_name: r.client_name || '',
       language_pair: r.language_pair || '', delivery_time: r.delivery_time || '', summary: r.summary || '',
     }));
     const file = path.join(WORKDIR, 'chat_' + phone + '.json');
-    fs.writeFileSync(file, JSON.stringify({ phone, jids, existing_rows, conversation }, null, 1));
-    manifest.push({ phone, file, msgs: conversation.length, existing: existing_rows.length });
+    fs.writeFileSync(file, JSON.stringify({
+      phone, jids, existing_rows,
+      context: trimmedContext,
+      new_messages: newMessages,
+      context_truncated: context.length > trimmedContext.length,
+    }, null, 1));
+    manifest.push({
+      phone, file, new: newMessages.length, context: trimmedContext.length, existing: existing_rows.length,
+    });
   }
 
-  // ---- COUNTERPARTY PASS INPUTS -------------------------------------------------
-  // CRITICAL STRUCTURAL GUARD (docs/GUARDS.md #11): only HANDOFF_ELIGIBLE records are
-  // offered as candidates. We routinely forward a document to a counterparty JUST TO GET
-  // A PRICE QUOTE before the customer has committed or paid — that is NOT a handoff.
-  // Filtering here, in code, means a quote-check can never be misread as a handoff no
-  // matter what the model thinks. Do not move this into the prompt.
+  // ---- Counterparty pass inputs -------------------------------------------------------
+  // STRUCTURAL GUARD (GUARDS #11): only HANDOFF_ELIGIBLE records are offered as candidates.
+  // We forward documents to a counterparty JUST TO GET A PRICE QUOTE, which is not a
+  // handoff. Filtering here, in code, means a quote-check can never be misread as one — no
+  // matter what the model concludes. Do not move this into the prompt.
   const inFlight = storeRows
     .filter((r) => canon(r.phone) && !COUNTERPARTIES[canon(r.phone)]
       && HANDOFF_ELIGIBLE.has(String(r.status).trim()) && r.record_id)
@@ -176,54 +272,62 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
   ];
 
   for (const ch of channels) {
-    const jids = ch.jids
-      || [ch.phone + '@s.whatsapp.net', ...(pnToLids.get(ch.phone) || []).map((l) => l + '@lid')];
+    const jids = ch.jids || jidsForPhone(ch.phone);
     const ph = '(' + jids.map(() => '?').join(',') + ')';
-    // A handoff thread spans days, so include a context window — not just the new tail.
     const lookback = new Date(Date.now() - cfg.counterpartyLookbackDays * 864e5)
       .toISOString().replace('T', ' ').slice(0, 19);
     // Union the context window with the rowid delta: a RESTORED message can be newly
     // inserted with an OLD send timestamp and would fall outside a pure time window.
     const msgs = cursorMode === 'rowid'
       ? M.prepare(
-        'SELECT rowid,id,timestamp,is_from_me,media_type,filename,content FROM messages ' +
-        'WHERE chat_jid IN ' + ph + ' AND rowid <= ? AND (timestamp > ? OR rowid > ?) ORDER BY timestamp,rowid'
-      ).all(...jids, maxRowid, lookback, sinceRowid)
+        'SELECT rowid,id,timestamp,is_from_me,media_type,filename,content FROM messages '
+        + 'WHERE chat_jid IN ' + ph + ' AND rowid <= ? AND (timestamp > ? OR rowid > ?) ORDER BY timestamp,rowid'
+      ).all(...jids, ceiling, lookback, sinceRowid)
       : M.prepare(
-        'SELECT rowid,id,timestamp,is_from_me,media_type,filename,content FROM messages ' +
-        'WHERE chat_jid IN ' + ph + ' AND rowid <= ? AND timestamp > ? ORDER BY timestamp,rowid'
-      ).all(...jids, maxRowid, lookback);
+        'SELECT rowid,id,timestamp,is_from_me,media_type,filename,content FROM messages '
+        + 'WHERE chat_jid IN ' + ph + ' AND rowid <= ? AND timestamp > ? ORDER BY timestamp,rowid'
+      ).all(...jids, ceiling, lookback);
     if (!msgs.length) continue;
 
-    for (const m of msgs) if (isMessageNew(m, boundary)) maxTs = latestTimestamp(maxTs, m.timestamp);
+    const newMessages = [];
+    const context = [];
+    for (const m of msgs) {
+      if (isNew(m)) {
+        newMessages.push(toRow(m, m.is_from_me ? 'BUSINESS' : 'COUNTERPARTY', true));
+        maxTs = latestTimestamp(maxTs, m.timestamp);
+      } else {
+        context.push(toRow(m, m.is_from_me ? 'BUSINESS' : 'COUNTERPARTY', false));
+      }
+    }
+    if (!newMessages.length) continue;
 
-    const conversation = msgs.map((m) => ({
-      id: m.id,
-      ts: String(m.timestamp).slice(0, 16),
-      from: m.is_from_me ? 'BUSINESS' : 'COUNTERPARTY',
-      is_new: isMessageNew(m, boundary),
-      text: m.content || (m.media_type ? '[' + m.media_type + (m.filename ? ': ' + m.filename : '') + ']' : ''),
-    }));
     const file = path.join(WORKDIR, 'counterparty_' + ch.name + '.json');
     fs.writeFileSync(file, JSON.stringify({
-      counterparty: ch.name, phone: ch.phone, in_flight: inFlight, conversation,
+      counterparty: ch.name, phone: ch.phone, in_flight: inFlight,
+      context: context.slice(-MAX_CONTEXT),
+      new_messages: newMessages,
     }, null, 1));
-    counterparties.push({ counterparty: ch.name, file, msgs: conversation.length, in_flight: inFlight.length });
+    counterparties.push({
+      counterparty: ch.name, file, new: newMessages.length, in_flight: inFlight.length,
+    });
   }
 
   fs.writeFileSync(path.join(WORKDIR, 'manifest.json'), JSON.stringify({
-    cursorMode, sinceRowid, sinceTs, maxRowid, maxTs,
+    cursorMode, sinceRowid, sinceTs,
+    maxRowid: ceiling,          // the cursor may advance ONLY to what we actually processed
+    frozenMaxRowid: boundary.maxRowid,
+    chunked, maxTs,
     count: manifest.length, chats: manifest, counterparties,
   }, null, 1));
 
   console.log(
     'tracker-prep:',
     cursorMode === 'rowid' ? 'after rowid ' + sinceRowid : 'since ' + sinceTs,
-    '-> rowid ' + maxRowid,
-    '| active customer chats:', manifest.length,
-    '| active counterparty chats:', counterparties.length
+    '-> rowid ' + ceiling + (chunked ? ' (chunked from ' + boundary.maxRowid + ')' : ''),
+    '| customer chats:', manifest.length,
+    '| counterparty chats:', counterparties.length
   );
-  manifest.forEach((m) => console.log('  ' + m.phone + '  msgs=' + m.msgs + '  existing=' + m.existing));
-  counterparties.forEach((v) => console.log('  counterparty:' + v.counterparty + '  msgs=' + v.msgs + '  in_flight=' + v.in_flight));
+  manifest.forEach((m) => console.log('  ' + m.phone + '  new=' + m.new + '  context=' + m.context + '  existing=' + m.existing));
+  counterparties.forEach((v) => console.log('  counterparty:' + v.counterparty + '  new=' + v.new + '  in_flight=' + v.in_flight));
   if (!manifest.length && !counterparties.length) console.log('  (nothing new — the tick can skip the model entirely)');
 })().catch((e) => { console.error('ERR', e.message); process.exit(1); });

@@ -17,14 +17,22 @@ money. Port the guards, not just the happy path. See [docs/GUARDS.md](docs/GUARD
 
 ## 0. The one-paragraph architecture
 
-> A message stream → a periodic deterministic scan bounded by a **rowid cursor** → **one
-> LLM judgment call per chat** → an idempotent **upsert keyed by a stable record id**
-> into a durable store, with SQLite as memory and monotonic guards protecting hard-won
-> state.
+> A message stream → a periodic deterministic scan bounded by an **ingestion-order cursor**
+> → **one LLM judgment call per changed conversation** → deterministic **validation and a
+> lifecycle reducer** → an idempotent **upsert keyed by a stable record id**.
 
 **Golden rule:** deterministic I/O lives in scripts; the *only* judgment step is the
 headless LLM call. Scripts = mechanism and compliance. LLM = reasoning. SQLite +
-cursor state = memory. Keep the LLM boundary thin and everything around it testable.
+cursor state = memory.
+
+**The model reports OBSERVATIONS. Code derives STATE.** The model never emits a status — it
+emits evidence-backed observations (`payment_received`, `draft_sent`, `final_delivered`) and
+`scripts/lib/status-model.cjs` maps them to a stage. That boundary deletes a class of failure
+prompt engineering could only discourage: a customer typing "Done" (meaning *they paid*)
+cannot reach the terminal stage, and a draft cannot complete a record, because neither
+observation maps there. The model still does the hard part — which record does this belong
+to, did the customer really commit, is this image a receipt or the source document, is this a
+draft or the final.
 
 ---
 
@@ -44,17 +52,20 @@ Full detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
-## 2. The rowid cursor is the load-bearing correctness fix
+## 2. The ingestion cursor is the load-bearing correctness fix
 
 **Never revert this to a timestamp watermark.**
 
-In the source system, `messages` is a rowid table and **rowid order ≠ timestamp order**:
-20 inversions in the last 4,000 messages, worst ~6 days late. A timestamp watermark makes
-a late-arriving message with an old timestamp **unreachable forever** — that is not a
-patchable bug, it is a whole outage blind-spot class. Per-source **rowid** cursors close it.
+`messages` is a rowid table and **rowid order ≠ timestamp order**: 20 inversions in the last
+4,000 messages, worst ~6 days late. A timestamp watermark makes a late-arriving message with
+an old timestamp **unreachable forever** — not a patchable bug but a whole outage blind-spot
+class. Ingestion-order cursors close it.
 
 **Cardinal rule:** *never advance a cursor over a message you did not show the LLM.*
-Every silent-data-loss bug this system ever had has that shape.
+Every silent-data-loss bug this system has had has that shape — including one caused by a
+**context-truncation cap** (GUARDS #23), which is why prep emits `new_messages` (never
+truncated) separately from `context` (capped), and lowers the ingestion boundary rather than
+dropping evidence when a delta is too large.
 
 `scripts/lib/message-cursor.cjs` is ported verbatim. Treat it as frozen.
 
@@ -70,15 +81,17 @@ cp .env.example .env          # fill in the values below
 node --test                   # sanity
 ```
 
-1. **Stand up the bridge.** See [bridge/README.md](bridge/README.md). Clone
-   `lharries/whatsapp-mcp`, apply the `/api/health` patch (this kit's supervisor
-   *requires* it), build, run once interactively to scan the QR.
+1. **Choose your ingress — read [docs/INGRESS.md](docs/INGRESS.md) FIRST.** If WhatsApp
+   Business App *Coexistence* fits your workflow, you can drop the bridge, the keepalive
+   lane, LID mapping and the Go toolchain entirely. If you need group chats or history from
+   before onboarding, use the bridge: see [bridge/README.md](bridge/README.md), and apply the
+   `/api/health` patch (the supervisor *requires* it).
 2. **Deploy the store backend.** Paste `apps-script/Code.gs` into the Sheet's Apps
    Script editor, set the `SHEET_SECRET` and `WATCHDOG_EMAIL` Script Properties, run
    `setupHeaders()` then `applyFilterAndSort()` then `applyStatusFormatting()` then
    `makeAllValidationsWarnOnly()`, deploy as a Web App (Execute as Me / Anyone), and
    put the `/exec` URL in `.env` as `SHEET_WEBHOOK_URL`.
-3. **Adapt the three seams** — see §4. Do this *before* the first real run.
+3. **Adapt the seams** — see §4. Do this *before* the first real run.
 4. **Authenticate a model provider.** For Claude Code, `claude setup-token` gives a
    long-lived token; put it on ONE line in `agent-token.env`. A normal login token
    expires ~daily and a headless subprocess **cannot refresh it** — see GUARDS #12.
@@ -93,33 +106,29 @@ node --test                   # sanity
 
 ---
 
-## 4. The three seams — the ONLY things you must change
+## 4. Core invariants vs. business modules
 
-Everything else ports unchanged. Full guide: [docs/PORTING.md](docs/PORTING.md).
+Full guide: [docs/PORTING.md](docs/PORTING.md).
 
-### Seam 1 — the extraction contract (`prompts/*.txt`)
+**Core invariants — port unchanged.** The ingestion cursor, the run lock, fail-closed
+validation and evidence binding, the never-truncate-new-evidence rule, the guarded
+derivation at the writer, transport-only keepalive, and the store client's upsert/merge
+semantics. These *are* the correctness of the system.
 
-Prompts are **data, not code**: they live in `.txt` files behind a fail-closed
-`loadPrompt()`. A garbled prompt produces bad extractions (caught by validation); it can
-never crash the lane. `prompts/TEMPLATE-NOTES.md` marks every paragraph
-**STRUCTURAL** (port verbatim — it encodes a production incident) or **DOMAIN**
-(rewrite for your business).
+**Business modules — adapt or delete:**
 
-### Seam 2 — the lifecycle model (`scripts/lib/status-model.cjs`)
-
-One file owns `VALID_STATUS`, `STATUS_RANK`, `TERMINAL_STATUS`, and `HANDOFF_ELIGIBLE`.
-Two rules survive any domain:
-
-- **Status is a pure lifecycle STAGE** — *where* the record is. *Who* is doing the work
-  is a **column**, never a status. Collapsing those two produced GUARDS #11.
-- **Rank is monotonic.** The extractor re-emits historical records on every run, so
-  without a rank a finished record gets walked backwards by a stale re-read (GUARDS #13).
-
-### Seam 3 — the store schema (`apps-script/Code.gs` `SHEETS`)
-
-`{key, sortCol, headers, merge}` per tab. A column must appear in **both** `headers` and
-`merge` — one that is only in `headers` gets created and then never populated on any
-existing row.
+1. **Extraction contract** (`prompts/*.txt`) — prompts are **data, not code**, behind a
+   fail-closed `loadPrompt()`, so a garbled prompt can never crash the lane.
+   `prompts/TEMPLATE-NOTES.md` marks each paragraph STRUCTURAL or DOMAIN.
+2. **Lifecycle model** (`scripts/lib/status-model.cjs`) — stages, observations, and the
+   reducer. Keep: status is a stage not an owner; transitions are explicit via
+   `canAutomatedTransition`, never a bare rank comparison (GUARDS #22); `HANDOFF_ELIGIBLE`
+   excludes your committed-but-unstarted stage (GUARDS #11).
+3. **Store schema** (`apps-script/Code.gs` → `SHEETS`) — a column must appear in **both**
+   `headers` and `merge`, or it is created and then never populated.
+4. **Counterparties** (`counterparty.cjs`) — delete if you don't outsource.
+5. **Payments** (`src/payments.js`, `reconcile.js`, `cli.js`) — delete if not needed.
+6. **Attribution** — recommended for a new site; see PORTING §7.
 
 ---
 
@@ -132,14 +141,15 @@ config.js                    .env loader + config defaults
 cli.js                       payment reconciliation entry point
 
 scripts/
-  tracker-prep.cjs           DETERMINISTIC: cursor → dump changed chats to JSON
-  tracker-watch.cjs          the tick: supervise bridge → prep → LLM → apply
-  tracker-apply.cjs          DETERMINISTIC: validate → monotonic guard → upsert
+  tracker-prep.cjs           DETERMINISTIC: cursor → new_messages + context per chat
+  tracker-watch.cjs          the tick: supervise → prep → LLM → apply
+  tracker-apply.cjs          DETERMINISTIC: reduce observations → guarded upsert
+  tracker-admin.cjs          the agent lane's correction tool (snapshot/validate/apply)
   bridge-keepalive.cjs       TRANSPORT ONLY: keeps the socket alive. Never a writer.
   lib/
-    message-cursor.cjs       the rowid cursor. FROZEN — port verbatim.
+    message-cursor.cjs       the ingestion cursor. FROZEN — port verbatim.
     run-lock.cjs             atomic, owner-checked, stale-reaping run lock.
-    status-model.cjs         SEAM 2 — the lifecycle model.
+    status-model.cjs         lifecycle model + observation reducer + transition guard.
     client-result.cjs        fail-closed validation + stable record-id minting.
     agent-provider.cjs       provider chain (claude | codex | any command).
     bridge-supervisor.cjs    health-probe supervision + restart budget + escalation.

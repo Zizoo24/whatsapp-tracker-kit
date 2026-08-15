@@ -133,11 +133,25 @@ function extractJson(text, validate, input) {
 // Try each provider in the chain, twice each. A rejected result is fed BACK to the model
 // as explicit validation feedback, which converts most malformed outputs into a correct
 // retry instead of a deferral.
+//
+// TRUNCATION RULE (docs/GUARDS.md #23): `new_messages` is NEVER truncated here. Prep already
+// guaranteed the delta fits the budget by lowering the ingestion boundary instead of
+// dropping evidence. Only `context` — which can never justify a write — may be trimmed.
+// v1 truncated a single merged, timestamp-sorted array, so a newly ingested message with an
+// old timestamp could be cut while the cursor still advanced past its rowid.
 function extractFile(file, rules, validate) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-  if (Array.isArray(raw.conversation) && raw.conversation.length > MAX_MSGS) {
-    raw.conversation = raw.conversation.slice(-MAX_MSGS);
-    raw.note = 'conversation truncated to the newest ' + MAX_MSGS + ' messages';
+  if (Array.isArray(raw.context) && raw.context.length > MAX_MSGS) {
+    raw.context = raw.context.slice(-MAX_MSGS);
+    raw.context_truncated = true;
+  }
+  if (Array.isArray(raw.new_messages) && raw.new_messages.length > MAX_MSGS) {
+    // Prep should have chunked the boundary; reaching here means the two budgets disagree.
+    // Refuse rather than silently drop evidence.
+    log('  ABORT ' + path.basename(file) + ': ' + raw.new_messages.length
+      + ' new messages exceeds TRACKER_MAX_MSGS=' + MAX_MSGS
+      + ' — raise it or lower TRACKER_MAX_NEW_MSGS; refusing to truncate new evidence');
+    return null;
   }
   let validationFeedback = '';
   for (const provider of AGENT_CHAIN) {

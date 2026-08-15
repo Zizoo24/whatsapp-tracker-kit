@@ -302,6 +302,69 @@ permanently unreachable.
 
 ---
 
+---
+
+## #22 — The validator and the writer disagreed about a legal transition
+
+**Found by external audit of v1 of this kit.** The lifecycle contract explicitly allowed
+`done → revision` (a real post-delivery correction), and validation accepted it. But the
+writer compared ranks — `revision` is 3, `done` is 4 — classified it as a downgrade, and
+**silently deleted the status**. So a legitimate revision was accepted by one layer and
+discarded by the next.
+
+Both layers were individually "correct". The **contract between them** was broken, and every
+unit test passed because none crossed the boundary.
+
+**Guards:**
+- `canAutomatedTransition(current, next, observation)` replaces the raw rank comparison. Rank
+  still orders the stages; it is no longer the sole authority on legality.
+- `test/integration-lifecycle.test.cjs` runs real validated output through the writer's real
+  derivation. **A passing unit suite is not evidence that two layers agree.**
+
+---
+
+## #23 — Context truncation silently defeated the rowid cursor
+
+**Found by external audit of v1.** Prep emitted one `conversation` array sorted by
+`(timestamp, rowid)`; the watcher kept only the newest N entries. But a message can be newly
+**ingested** with an **old send timestamp** — that is the entire reason the cursor is a rowid
+(see #12). Such a message sorts toward the front, gets truncated away, and the run then
+advances the cursor **past its rowid**.
+
+That is a direct violation of the cardinal rule — *never advance a cursor over a message you
+did not show the model* — reintroduced by a performance cap, in the very system built to
+prevent it.
+
+**Guards:**
+- Prep emits **`new_messages`** (every message in the rowid delta, never truncated) and
+  **`context`** (older messages, capped). Only context may be trimmed, because context can
+  never justify a write.
+- If a chat's delta exceeds the budget, prep **lowers the ingestion boundary** for the pass
+  and records the processed ceiling in the manifest. The cursor advances only to what was
+  actually processed; the remainder arrives next tick.
+- The watcher **aborts** rather than truncating an oversized delta.
+
+---
+
+## #24 — Authoritative reads failed open
+
+**Found by external audit of v1.** Three reads logged their failure and continued:
+
+| Read | Consequence of continuing |
+|---|---|
+| the `@lid` map | chats keyed by `@lid` resolve to no phone, vanish from the manifest — and the global cursor advances past them anyway |
+| existing store rows | every established record looks brand new, so the model re-creates records that already exist |
+| the writer's current-status pre-read | v1 said *"proceeding without it"* and wrote blind, disabling the one guard protecting completed records |
+
+Each turns a **transient** error into **permanent** corruption. The third is the sharpest:
+the guard was disabled exactly when the information needed to enforce it was missing.
+
+**Guard:** all three now **fail closed** — abort, keep the cursor, retry next tick. Fail-open
+is only ever acceptable for genuinely optional signals (alerts, heartbeats), never for
+anything the correctness of a write depends on.
+
+---
+
 ## The meta-lessons
 
 1. **Never advance a cursor over a message you did not show the model.** Every
@@ -314,3 +377,13 @@ permanently unreachable.
    closed, keep the cursor, retry.
 6. **Test alert channels.** An alarm whose send permission has never been exercised is
    decoration.
+7. **Test the contract BETWEEN layers, not just each layer.** #22 hid behind a fully green
+   unit suite because no test crossed the seam.
+8. **Fail open only for optional signals.** Alerts and heartbeats may degrade. Anything a
+   write's correctness depends on must fail closed (#24).
+9. **A performance cap can silently break a correctness invariant.** #23 was a truncation
+   added for cost that quietly re-opened the data-loss class the cursor exists to close.
+   When adding a limit, ask what it is allowed to drop.
+10. **Let code decide what code can decide.** Moving status derivation out of the model
+    (observations → reducer) deleted a whole class of prompt-only safeguards. The model
+    should be asked only what genuinely requires reading comprehension.

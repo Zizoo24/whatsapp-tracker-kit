@@ -2,20 +2,21 @@
 'use strict';
 // tracker-apply.cjs — DETERMINISTIC WRITE. No model call happens here.
 //
-// Reads .tracker-work/results.json, enforces the monotonic lifecycle guard, upserts by
-// record_id, and — ONLY on full success — advances the rowid cursor.
+// Reads .tracker-work/results.json, derives each record's status from its OBSERVATIONS
+// against the live store, upserts by record_id, and — only on full success — advances the
+// rowid cursor.
 //
-// results.json shape:
+// results.json shape (produced by tracker-watch after validation):
 //   [ { "phone": "...", "records": [
 //       { "record_id": "<validated immutable id>", "start_date": "YYYY-MM-DD or '' for update",
-//         "client_name": "", "doc_type": "", "language_pair": "", "price": "",
-//         "delivery_time": "", "status": "paid", "summary": "" }, ... ] }, ... ]
+//         "observations": [{ "type": "payment_received", "evidence_msg_ids": ["m1"] }],
+//         "client_name": "", "doc_type": "", ... } ] } ]
 //
 // Usage: node scripts/tracker-apply.cjs [--keep-cursor]
 
 const fs = require('fs');
 const path = require('path');
-const { STATUS_RANK, VALID_STATUS } = require('./lib/status-model.cjs');
+const { VALID_STATUS, canAutomatedTransition, reduceObservations } = require('./lib/status-model.cjs');
 const { advanceCursorState } = require('./lib/message-cursor.cjs');
 
 const ROOT = path.join(__dirname, '..');
@@ -33,74 +34,108 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
   const { appendRows, fetchRows } = await import('file://' + path.join(ROOT, 'src', 'sheet.js').replace(/\\/g, '/'));
   const cfg = loadConfig();
 
-  const rows = [];
+  const pending = [];
   for (const entry of results) {
     const phone = canon(entry.phone);
     for (const d of entry.records || []) {
-      // A record without a validated id is a bug upstream, not something to paper over:
-      // writing it would create an unaddressable row nothing can ever update.
+      // A record without a validated id is an upstream bug, not something to paper over:
+      // writing it creates an unaddressable row that nothing can ever update.
       if (!d.record_id) {
         console.error('refusing a record without a validated record_id');
         process.exit(1);
       }
-      if (!VALID_STATUS.has(d.status)) continue; // defensive: drop anything off-model
-      const row = {
-        record_id: d.record_id,
-        source_date: d.start_date || '',
-        client_name: d.client_name || '',
-        phone,
-        doc_type: d.doc_type || '',
-        language_pair: d.language_pair || '',
-        price: d.price || '',
-        delivery_time: d.delivery_time || '',
-        status: d.status,
-        summary: d.summary || '',
-      };
-      if (d.counterparty) row.counterparty = d.counterparty;
-      rows.push(row);
+      pending.push({ phone, record: d });
     }
   }
 
-  // ---- THE MONOTONIC LIFECYCLE GUARD (docs/GUARDS.md #13) ----------------------------
-  // The extractor re-emits historical records on every run. An old, completed record shows
-  // only its payment in the messages, so it comes back at an EARLIER stage. Without this
-  // guard, the moment a repeat customer sends ANY message the whole thread is re-extracted
-  // and a finished record silently walks backwards.
-  //
-  // WHY HERE AND NOT IN THE STORE API: the API is ALSO the correction path. Fixing a
-  // wrongly-set terminal status requires posting a backward move, which an API-layer guard
-  // would refuse — it would block exactly the write the operator needs. Guard the sole
-  // AUTOMATED writer (the thing that re-emits stale reads); keep the API a dumb, honest
-  // upsert. Note this only blocks DOWNGRADES, so a false promotion stays permanent and
-  // must be fixed by an explicit correction.
-  if (rows.length) {
+  if (!pending.length) {
+    // The chats WERE evaluated; they simply held nothing committed. That is a normal,
+    // correct outcome — not a failure — so the cursor should still advance.
+    console.log('tracker-apply: no committed records to write this run');
+  }
+
+  // ---- Read the authoritative current state: FAIL CLOSED (docs/GUARDS.md #24) ----------
+  // The reducer needs each record's CURRENT status to decide which observations may apply.
+  // v1 caught a failed pre-read and wrote anyway "without the guard" — precisely inverting
+  // the fail-closed rule at the one place it protects hard-won state. If we cannot see the
+  // current state, we do not write and we do not advance the cursor.
+  let currentByRecord = new Map();
+  if (pending.length) {
     try {
       const currentRows = await fetchRows(cfg, 'Records');
-      const currentByRecord = new Map();
       for (const r of currentRows) if (r.record_id) currentByRecord.set(String(r.record_id), r);
-      for (const row of rows) {
-        const currentStatus = String(currentByRecord.get(String(row.record_id))?.status || '').trim();
-        const cr = STATUS_RANK[currentStatus];
-        const nr = STATUS_RANK[row.status];
-        if (cr != null && nr != null && nr < cr) {
-          console.log(`guard: kept "${currentStatus}" for ${row.record_id} (refused downgrade to "${row.status}")`);
-          // Delete the key so the non-empty merge leaves the advanced stage intact while
-          // every OTHER field still refreshes.
-          delete row.status;
+    } catch (e) {
+      console.error('ABORT: could not read current store state (' + e.message + '). '
+        + 'Refusing to write without it — a blind write can silently walk a completed record '
+        + 'backwards. The cursor is kept; the next tick retries.');
+      process.exit(1);
+    }
+  }
+
+  // ---- Derive status from observations ------------------------------------------------
+  // THE GUARD LIVES HERE, AT THE SOLE AUTOMATED WRITER — never in the store API, which is
+  // also the correction path and must stay a dumb, honest upsert (GUARDS #13).
+  //
+  // canAutomatedTransition (inside the reducer) replaces v1's raw rank comparison, which
+  // classified the legitimate `done -> revision` move as a downgrade and silently discarded
+  // it while validation had explicitly allowed it (GUARDS #22).
+  const rows = [];
+  for (const { phone, record } of pending) {
+    const current = currentByRecord.get(String(record.record_id));
+    const currentStatus = String(current?.status || '').trim();
+    const observations = Array.isArray(record.observations) ? record.observations : [];
+
+    let status;
+    if (observations.length) {
+      const derived = reduceObservations(currentStatus || null, observations);
+      status = derived.status;
+      for (const r of derived.refused) {
+        console.log(`guard: ${record.record_id} refused ${r.observation} (${r.reason})`);
+      }
+      if (!status || status === currentStatus) {
+        // Every observation was refused, or none moved the record. Other fields may still
+        // legitimately refresh, so fall through with no status key rather than dropping the
+        // row — the non-empty merge then leaves the existing stage intact.
+        status = null;
+      }
+    } else {
+      // A pre-derived status (the counterparty pass supplies one directly, with no
+      // observations) must clear the SAME gate. The in-run precedence check in
+      // result-merge.cjs only sees this run's results; the live store may have moved on
+      // since prep read it, so the authoritative check has to happen here too.
+      const incoming = String(record.status || '').trim();
+      if (!VALID_STATUS.has(incoming)) {
+        status = null;
+      } else {
+        const verdict = canAutomatedTransition(currentStatus || null, incoming);
+        if (verdict.allowed) {
+          status = incoming;
+        } else {
+          status = null;
+          console.log(`guard: ${record.record_id} kept "${currentStatus}" (${verdict.reason})`);
         }
       }
-    } catch (e) {
-      console.error('status guard pre-read failed (proceeding without it):', e.message);
     }
+
+    const row = {
+      record_id: record.record_id,
+      source_date: record.start_date || '',
+      client_name: record.client_name || '',
+      phone,
+      doc_type: record.doc_type || '',
+      language_pair: record.language_pair || '',
+      price: record.price || '',
+      delivery_time: record.delivery_time || '',
+      summary: record.summary || '',
+    };
+    if (status) row.status = status;
+    if (record.counterparty) row.counterparty = record.counterparty;
+    rows.push(row);
   }
 
   if (rows.length) {
     const res = await appendRows(rows, cfg, 'Records'); // upsert by record_id
     console.log('tracker-apply:', JSON.stringify(res), '| rows:', rows.length);
-  } else {
-    // The chats WERE evaluated; they just held nothing committed. That is a normal,
-    // correct outcome — not a failure — and the cursor should still advance.
-    console.log('tracker-apply: no committed records to write this run');
   }
 
   // A PARTIAL run still applies its successful rows but KEEPS the cursor, so the deferred
@@ -110,6 +145,8 @@ const canon = (s) => String(s || '').replace(/\D/g, '');
     return;
   }
   const manifest = JSON.parse(fs.readFileSync(path.join(WORKDIR, 'manifest.json'), 'utf8'));
+  // manifest.maxRowid is the boundary prep ACTUALLY processed (possibly chunked below the
+  // frozen maximum), so the cursor can never overrun evidence the model was not shown.
   const next = advanceCursorState(STATE, manifest);
   console.log('cursor advanced to rowid', next.lastRowid, '| message time', next.lastTs);
 })().catch((e) => { console.error('ERR', e.message); process.exit(1); });
