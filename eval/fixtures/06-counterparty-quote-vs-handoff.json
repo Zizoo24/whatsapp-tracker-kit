@@ -1,0 +1,46 @@
+{
+  "name": "a document forwarded for a price quote is NOT a handoff",
+  "why": "GUARDS #11, the Abeer bug. We routinely forward a document to a translator just to get a price. Reading that as a handoff invents work that never started.",
+  "prompt": "counterparty",
+  "input": {
+    "counterparty": "vendor-a",
+    "in_flight": [
+      {
+        "record_id": "971500000000_2026-08-01#dddddddddd",
+        "doc_type": "medical report",
+        "language_pair": "English to Arabic",
+        "price": "AED 400",
+        "status": "paid"
+      }
+    ],
+    "context": [],
+    "new_messages": [
+      {
+        "id": "m1",
+        "ts": "2026-08-02T09:00:00Z",
+        "seq": 601,
+        "from": "BUSINESS",
+        "text": "[document: unrelated_tender_docs.pdf]"
+      },
+      {
+        "id": "m2",
+        "ts": "2026-08-02T09:01:00Z",
+        "seq": 602,
+        "from": "BUSINESS",
+        "text": "How much would you charge for this one? Just need a price before I quote the client."
+      },
+      {
+        "id": "m3",
+        "ts": "2026-08-02T09:30:00Z",
+        "seq": 603,
+        "from": "COUNTERPARTY",
+        "text": "That would be around AED 600"
+      }
+    ]
+  },
+  "expect": {
+    "updates": 0,
+    "reviews": 0,
+    "why_empty": "the only document discussed is a price check for work that is not in_flight"
+  }
+}

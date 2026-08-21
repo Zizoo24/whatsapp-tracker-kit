@@ -1,0 +1,46 @@
+{
+  "name": "a customer typing Done means THEY paid",
+  "why": "GUARDS #14. This shipped a brand-new order straight into the terminal stage. The word maps to payment_received, never final_delivered.",
+  "prompt": "customer",
+  "input": {
+    "phone": "971500000000",
+    "existing_rows": [],
+    "context": [],
+    "new_messages": [
+      {
+        "id": "m1",
+        "ts": "2026-08-01T20:50:00Z",
+        "seq": 201,
+        "from": "CUSTOMER",
+        "text": "I need a leave transfer letter translated"
+      },
+      {
+        "id": "m2",
+        "ts": "2026-08-01T20:53:00Z",
+        "seq": 202,
+        "from": "BUSINESS",
+        "text": "AED 40. Here is the payment link: https://pay.example.com/xyz"
+      },
+      {
+        "id": "m3",
+        "ts": "2026-08-01T21:26:00Z",
+        "seq": 203,
+        "from": "CUSTOMER",
+        "text": "Done"
+      }
+    ]
+  },
+  "expect": {
+    "records": 1,
+    "kind": "new",
+    "must_observe": [
+      "order_committed",
+      "payment_received"
+    ],
+    "must_not_observe": [
+      "final_delivered",
+      "draft_sent"
+    ],
+    "projects_to": "paid"
+  }
+}

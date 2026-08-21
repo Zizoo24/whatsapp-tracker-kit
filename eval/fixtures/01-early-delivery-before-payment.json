@@ -1,0 +1,59 @@
+{
+  "name": "early delivery before payment must still be observed",
+  "why": "GUARDS #25. The milestone model exists because delivering before payment is real. If the model withholds final_delivered because the order looks unpaid, the record never completes when payment later lands.",
+  "prompt": "customer",
+  "input": {
+    "phone": "971500000000",
+    "existing_rows": [],
+    "context": [],
+    "new_messages": [
+      {
+        "id": "m1",
+        "ts": "2026-08-01T09:00:00Z",
+        "seq": 101,
+        "from": "CUSTOMER",
+        "text": "Hi, I need my degree certificate translated to Arabic for MOHRE"
+      },
+      {
+        "id": "m2",
+        "ts": "2026-08-01T09:05:00Z",
+        "seq": 102,
+        "from": "BUSINESS",
+        "text": "Certainly - AED 150, ready within 24 hours. Shall I proceed?"
+      },
+      {
+        "id": "m3",
+        "ts": "2026-08-01T09:07:00Z",
+        "seq": 103,
+        "from": "CUSTOMER",
+        "text": "Yes please go ahead"
+      },
+      {
+        "id": "m4",
+        "ts": "2026-08-01T15:40:00Z",
+        "seq": 104,
+        "from": "BUSINESS",
+        "text": "[document: ATS Translation_Degree.pdf]"
+      },
+      {
+        "id": "m5",
+        "ts": "2026-08-01T15:41:00Z",
+        "seq": 105,
+        "from": "BUSINESS",
+        "text": "All done! Here is your stamped certified translation. We would appreciate a review: https://share.google/abc"
+      }
+    ]
+  },
+  "expect": {
+    "records": 1,
+    "kind": "new",
+    "must_observe": [
+      "order_committed",
+      "final_delivered"
+    ],
+    "must_not_observe": [
+      "payment_received"
+    ],
+    "projects_to": "confirmed_unpaid"
+  }
+}

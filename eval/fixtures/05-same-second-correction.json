@@ -1,0 +1,48 @@
+{
+  "name": "a correction requested right after delivery reopens the record",
+  "why": "GUARDS #28. Delivery and the correction can land in the same second; the observation must still be reported so ingestion order can resolve it.",
+  "prompt": "customer",
+  "input": {
+    "phone": "971500000000",
+    "existing_rows": [
+      {
+        "record_id": "971500000000_2026-08-01#cccccccccc",
+        "source_date": "2026-08-01",
+        "doc_type": "birth certificate",
+        "price": "AED 90",
+        "status": "done",
+        "paid_at": "2026-08-01T10:00:00Z",
+        "milestones": "{\"committed\":{\"at\":\"2026-08-01T09:00:00Z\",\"seq\":501,\"message_id\":\"z1\"},\"paid\":{\"at\":\"2026-08-01T10:00:00Z\",\"seq\":502,\"message_id\":\"z2\"},\"final_delivered\":{\"at\":\"2026-08-01T12:00:00Z\",\"seq\":503,\"message_id\":\"z3\"}}"
+      }
+    ],
+    "context": [
+      {
+        "id": "z3",
+        "ts": "2026-08-01T12:00:00Z",
+        "seq": 503,
+        "from": "BUSINESS",
+        "text": "All done, here is the stamped translation"
+      }
+    ],
+    "new_messages": [
+      {
+        "id": "m1",
+        "ts": "2026-08-01T12:04:00Z",
+        "seq": 504,
+        "from": "CUSTOMER",
+        "text": "Thanks - but you spelled my surname wrong, it should be Al-Mansoori"
+      }
+    ]
+  },
+  "expect": {
+    "records": 1,
+    "kind": "update",
+    "must_observe": [
+      "revision_requested"
+    ],
+    "must_not_observe": [
+      "final_delivered"
+    ],
+    "projects_to": "revision"
+  }
+}

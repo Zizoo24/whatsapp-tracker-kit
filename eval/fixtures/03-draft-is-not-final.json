@@ -1,0 +1,54 @@
+{
+  "name": "a draft sent for review does not complete the order",
+  "why": "GUARDS #17. Draft and final are two business file-sends. Treating the draft as delivery means we stop chasing unfinished work.",
+  "prompt": "customer",
+  "input": {
+    "phone": "971500000000",
+    "existing_rows": [
+      {
+        "record_id": "971500000000_2026-08-01#aaaaaaaaaa",
+        "source_date": "2026-08-01",
+        "doc_type": "contract",
+        "price": "AED 300",
+        "status": "paid",
+        "paid_at": "2026-08-01T10:00:00Z",
+        "milestones": "{\"committed\":{\"at\":\"2026-08-01T09:00:00Z\",\"seq\":301,\"message_id\":\"x1\"},\"paid\":{\"at\":\"2026-08-01T10:00:00Z\",\"seq\":302,\"message_id\":\"x2\"}}"
+      }
+    ],
+    "context": [],
+    "new_messages": [
+      {
+        "id": "m1",
+        "ts": "2026-08-02T11:00:00Z",
+        "seq": 303,
+        "from": "BUSINESS",
+        "text": "[document: contract_draft.docx]"
+      },
+      {
+        "id": "m2",
+        "ts": "2026-08-02T11:01:00Z",
+        "seq": 304,
+        "from": "BUSINESS",
+        "text": "Please have a look before we stamp and print - any changes?"
+      },
+      {
+        "id": "m3",
+        "ts": "2026-08-02T12:30:00Z",
+        "seq": 305,
+        "from": "CUSTOMER",
+        "text": "Perfect, looks good"
+      }
+    ]
+  },
+  "expect": {
+    "records": 1,
+    "kind": "update",
+    "must_observe": [
+      "draft_sent"
+    ],
+    "must_not_observe": [
+      "final_delivered"
+    ],
+    "projects_to": "translating"
+  }
+}

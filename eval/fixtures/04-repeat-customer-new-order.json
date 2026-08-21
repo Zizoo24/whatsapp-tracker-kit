@@ -1,0 +1,64 @@
+{
+  "name": "a repeat customer later order is a NEW record",
+  "why": "GUARDS #13/#14. A terminal record must never be reused for later work, even same chat and same day.",
+  "prompt": "customer",
+  "input": {
+    "phone": "971500000000",
+    "existing_rows": [
+      {
+        "record_id": "971500000000_2026-08-01#bbbbbbbbbb",
+        "source_date": "2026-08-01",
+        "doc_type": "passport",
+        "price": "AED 100",
+        "status": "done",
+        "paid_at": "2026-08-01T10:00:00Z",
+        "milestones": "{\"committed\":{\"at\":\"2026-08-01T09:00:00Z\",\"seq\":401,\"message_id\":\"y1\"},\"paid\":{\"at\":\"2026-08-01T10:00:00Z\",\"seq\":402,\"message_id\":\"y2\"},\"final_delivered\":{\"at\":\"2026-08-01T14:00:00Z\",\"seq\":403,\"message_id\":\"y3\"}}"
+      }
+    ],
+    "context": [
+      {
+        "id": "old1",
+        "ts": "2026-08-01T14:00:00Z",
+        "seq": 403,
+        "from": "BUSINESS",
+        "text": "All done, here is your passport translation"
+      }
+    ],
+    "new_messages": [
+      {
+        "id": "m1",
+        "ts": "2026-08-05T09:00:00Z",
+        "seq": 410,
+        "from": "CUSTOMER",
+        "text": "Hi again, I need my marriage certificate done too, same as last time"
+      },
+      {
+        "id": "m2",
+        "ts": "2026-08-05T09:05:00Z",
+        "seq": 411,
+        "from": "BUSINESS",
+        "text": "Of course - AED 120 for that one. Proceed?"
+      },
+      {
+        "id": "m3",
+        "ts": "2026-08-05T09:06:00Z",
+        "seq": 412,
+        "from": "CUSTOMER",
+        "text": "Yes go ahead please"
+      }
+    ]
+  },
+  "expect": {
+    "records": 1,
+    "kind": "new",
+    "must_observe": [
+      "order_committed"
+    ],
+    "must_not_observe": [
+      "final_delivered",
+      "payment_received"
+    ],
+    "must_not_reuse_record_id": "971500000000_2026-08-01#bbbbbbbbbb",
+    "projects_to": "confirmed_unpaid"
+  }
+}
